@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import os
 
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1373466041342099507/GMkMgWO6DXx6ULaDvCx1kfM5MzluC4v1DbKSBEyz5fp39-qCB2VN142Uj8ptiQM_re7"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1373466041342099507/GMkMgWO6DXx6ULaDvCxq1kfM5MzluC4v1DbKSBEyz5fp39-qCB2VN142Uj8ptiQM_re7"
 PROXY_USER = "trdwseke-rotate"
 PROXY_PASS = "n0vc7b0ev31y"
 PROXY_HOST = "proxy.webshare.io"
