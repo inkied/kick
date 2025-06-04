@@ -1,38 +1,29 @@
 import asyncio
 import aiohttp
 import os
-import random
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1373466041342099507/GMkMgWO6DXx6ULaDvCxq1kfM5MzluC4v1DbKSBEyz5fp39-qCB2VN142Uj8ptiQM_re7"
 WEBSHARE_API_KEY = "pialip63c4jeia0g8e8memjyj77ctky7ooq9b37q"
-WORDLIST_FILES = [
-    "Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt",
-    "Nature.txt", "Philosophy.txt", "Tech.txt"
-]
+WORDLIST_FILES = ["Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt", "Nature.txt", "Philosophy.txt", "Tech.txt"]
 MAX_CONCURRENT_CHECKS = 20
 
 proxies = []
 proxy_index = 0
 lock = asyncio.Lock()
-discord_lock = asyncio.Lock()
 
 async def fetch_proxies():
-    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=1"
+    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct"
     headers = {"Authorization": f"Token {WEBSHARE_API_KEY}"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
-            try:
-                data = await resp.json()
-                if "results" not in data:
-                    print("Failed to fetch proxies:", data)
-                    return []
-                return [
-                    f"http://{proxy['username']}:{proxy['password']}@{proxy['ip']}:{proxy['port']}"
-                    for proxy in data['results'][:100]
-                ]
-            except Exception as e:
-                print("Error fetching proxies:", e)
+            data = await resp.json()
+            if "results" not in data:
+                print(f"Failed to fetch proxies: {data}")
                 return []
+            return [
+                f"http://{proxy['username']}:{proxy['password']}@{proxy['ip']}:{proxy['port']}"
+                for proxy in data["results"][:100]
+            ]
 
 async def get_next_proxy():
     global proxy_index
@@ -43,32 +34,30 @@ async def get_next_proxy():
 
 async def check_username(session, username):
     proxy = await get_next_proxy()
-    url = f"https://kick.com/api/v1/channels/{username}"
     try:
-        async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(f"https://kick.com/api/v1/channels/{username}", proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 404:
                 print(f"[AVAILABLE] {username}")
                 await send_to_discord(username)
             elif resp.status == 200:
                 print(f"[TAKEN] {username}")
     except Exception:
-        pass  # Ignore exceptions silently
+        pass  # Fail silently
 
 async def send_to_discord(username):
-    async with discord_lock:
-        await asyncio.sleep(5)  # Delay to prevent spam
-        payload = {"content": f"`{username}` is available on Kick.com!"}
-        async with aiohttp.ClientSession() as session:
-            try:
-                await session.post(DISCORD_WEBHOOK, json=payload)
-            except Exception:
-                pass
+    await asyncio.sleep(5)  # Prevent alert spam
+    payload = {"content": f"`{username}` is available on Kick.com!"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(DISCORD_WEBHOOK, json=payload)
+        except Exception:
+            pass
 
 async def load_wordlist():
     usernames = set()
     for file in WORDLIST_FILES:
         if os.path.exists(file):
-            with open(file, "r", encoding="utf-8") as f:
+            with open(file, "r") as f:
                 usernames.update(line.strip().lower() for line in f if line.strip())
     return list(usernames)
 
@@ -82,7 +71,7 @@ async def main():
 
     wordlist = await load_wordlist()
     if not wordlist:
-        print("No usernames found in wordlists, exiting.")
+        print("No usernames loaded.")
         return
 
     connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT_CHECKS)
