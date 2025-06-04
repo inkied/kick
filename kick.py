@@ -14,6 +14,7 @@ TELEGRAM_CHAT_ID = "7755395640"
 WEBSHARE_API_KEY = "pialip63c4jeia0g8e8memjyj77ctky7ooq9b37q"
 
 AVAILABLE_FILE = "available.txt"
+PROGRESS_FILE = "progress.txt"
 NUM_THREADS = 30
 PROXY_REFRESH_INTERVAL = 600  # seconds (10 minutes)
 CHECK_PAUSE = 0.1  # seconds pause between checks for proxy longevity
@@ -98,12 +99,28 @@ def load_wordlists():
     return all_words
 
 
-def username_generator(words):
-    # Cycle through words infinitely
+def save_progress(index):
+    try:
+        with open(PROGRESS_FILE, "w") as f:
+            f.write(str(index))
+    except Exception as e:
+        print(f"[ERROR] Saving progress failed: {e}")
+
+
+def load_progress():
+    try:
+        with open(PROGRESS_FILE, "r") as f:
+            return int(f.read().strip())
+    except:
+        return 0
+
+
+def username_generator(words, start_index=0):
+    i = start_index
+    length = len(words)
     while True:
-        random.shuffle(words)
-        for word in words:
-            yield word
+        yield words[i % length]
+        i += 1
 
 
 def check_username(username):
@@ -156,7 +173,7 @@ def start_checking(update: Update, context: CallbackContext):
 
     update.message.reply_text("Started username checking!")
 
-    # Load usernames
+    # Load usernames once and shuffle once for consistent order
     words = load_wordlists()
     if not words:
         update.message.reply_text("No valid wordlists found. Cannot start.")
@@ -164,13 +181,26 @@ def start_checking(update: Update, context: CallbackContext):
             running = False
         return
 
+    random.shuffle(words)
+
     def enqueue_usernames():
-        gen = username_generator(words)
+        start_idx = load_progress()
+        gen = username_generator(words, start_idx)
+        count_since_save = 0
+        current_idx = start_idx
+
         while True:
             with running_lock:
                 if not running:
+                    save_progress(current_idx)  # Save progress on stop
                     break
-            username_queue.put(next(gen))
+            username = next(gen)
+            username_queue.put(username)
+            current_idx += 1
+            count_since_save += 1
+            if count_since_save >= 50:
+                save_progress(current_idx)
+                count_since_save = 0
 
     threading.Thread(target=enqueue_usernames, daemon=True).start()
 
