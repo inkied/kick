@@ -12,15 +12,10 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 WEBSHARE_API_KEY = os.getenv("WEBSHARE_API_KEY")
 
-PROXY_USER = os.getenv("PROXY_USER")
-PROXY_PASS = os.getenv("PROXY_PASS")
-PROXY_HOST = os.getenv("PROXY_HOST")
-PROXY_PORT = int(os.getenv("PROXY_PORT"))
-
 WORDLIST_FILES = ["Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt", "Nature.txt", "Philosophy.txt", "Tech.txt"]
 
 MAX_CONCURRENT_CHECKS = 20
-DISCORD_MESSAGE_DELAY = 5  # seconds delay between Discord messages to avoid spam
+DISCORD_MESSAGE_DELAY = 2  # seconds between Discord messages
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="/", intents=intents)
@@ -36,6 +31,30 @@ checking = False
 check_task = None
 current_index = 0
 
+async def fetch_proxies():
+    global proxies
+    url = f"https://proxy.webshare.io/api/proxy/list/?page=1&page_size=100&country=all"
+    headers = {"Authorization": f"ApiKey {WEBSHARE_API_KEY}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                proxy_list = data.get("results", [])
+                proxies = []
+                for proxy in proxy_list:
+                    # Format: http://user:pass@host:port
+                    proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['proxy_address']}:{proxy['ports']['http']}"
+                    proxies.append(proxy_url)
+                print(f"Loaded {len(proxies)} proxies from Webshare.")
+            else:
+                print(f"Failed to fetch proxies, status code: {resp.status}")
+
+def get_next_proxy():
+    global proxy_index
+    proxy = proxies[proxy_index]
+    proxy_index = (proxy_index + 1) % len(proxies)
+    return proxy
+
 async def load_wordlist():
     usernames = set()
     for file in WORDLIST_FILES:
@@ -44,12 +63,9 @@ async def load_wordlist():
                 usernames.update(line.strip().lower() for line in f if line.strip())
     return list(usernames)
 
-def get_proxy_url():
-    return f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-
 async def check_username(session, username):
     global available_count
-    proxy_url = get_proxy_url()
+    proxy_url = get_next_proxy()
     try:
         async with session.get(f"https://kick.com/api/v1/channels/{username}", proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 404:
@@ -57,7 +73,7 @@ async def check_username(session, username):
                 await send_available(username)
             # 200 means taken, do nothing
     except Exception:
-        # silently ignore errors or you can log if you want
+        # ignore errors silently or log if you want
         pass
 
 async def send_available(username):
@@ -95,7 +111,7 @@ async def checker_loop():
             current_index += len(batch)
             if checked_count % 50 == 0 or current_index >= len(wordlist):
                 await send_progress()
-            await asyncio.sleep(1)  # small delay to keep proxies healthy
+            await asyncio.sleep(1)  # small delay to protect proxies
     checking = False
 
 @bot.command()
@@ -104,7 +120,6 @@ async def start(ctx):
     if checking:
         await ctx.send("Checker is already running.")
         return
-    # If finished previously, reset to start fresh or resume from current_index
     if current_index >= len(wordlist):
         checked_count = 0
         available_count = 0
@@ -128,6 +143,7 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     wordlist = await load_wordlist()
     print(f"Loaded {len(wordlist)} usernames from wordlists.")
+    await fetch_proxies()  # fetch proxies on startup
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
         await channel.send("Checker bot is online and ready! Use `/start` to begin.")
