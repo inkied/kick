@@ -144,11 +144,33 @@ async def on_ready():
     print(f"[Discord] Bot connected as {bot.user}")
     await proxy_manager.load()
 
-@bot.command(name="kickstart")
+@bot.command(name='kickstart')
 async def kickstart(ctx):
-    await ctx.send("🚀 Starting Kick checker...")
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    await run_checker(channel)
+    global checker_running
+    if checker_running:
+        await ctx.send("Checker is already running.")
+        return
+
+    checker_running = True
+
+    # Send start message to the command channel or specific channel
+    channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx.channel
+    await channel.send("*Checking Kick Users*")
+
+    await run_checker()  # Your async checker function
+
+@bot.command(name='kickstop')
+async def kickstop(ctx):
+    global checker_running
+    if not checker_running:
+        await ctx.send("Checker is not running.")
+        return
+
+    checker_running = False
+
+    # Send stop message
+    channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx.channel
+    await channel.send("*Checker Stopped*")
 
 @bot.command(name="kickstatus")
 async def kickstatus(ctx):
