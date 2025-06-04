@@ -1,84 +1,105 @@
-import asyncio
 import aiohttp
+import asyncio
 import random
+import time
 import os
 
-WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"
-WEBSHARE_API_KEY = "YOUR_WEBSHARE_API_KEY_HERE"
+WEBHOOK_URL = "your_discord_webhook_url_here"
+WEBSHARE_API_KEY = "your_webshare_api_key_here"
+WORDLIST_FILES = [
+    "Brandable.txt",
+    "Culture.txt",
+    "Gaming.txt",
+    "Mythology.txt",
+    "Nature.txt",
+    "Philosophy.txt",
+    "Tech.txt"
+]
 
-PROXY_FETCH_URL = "https://proxy.webshare.io/api/proxy/list/"
-PROXY_LIMIT = 100
+CHECK_DELAY = 1.2  # seconds delay between username checks
+PROXY_FETCH_COUNT = 100
 
-MAX_RETRIES = 3
-RATE_LIMIT_DELAY = 1.2  # seconds delay between requests per worker
+# Load usernames from all wordlists
+def load_usernames():
+    usernames = []
+    for file in WORDLIST_FILES:
+        if os.path.isfile(file):
+            with open(file, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+                usernames.extend(lines)
+    return list(set(usernames))  # deduplicate
 
+# Fetch proxies from Webshare
 async def fetch_proxies():
+    url = f"https://proxy.webshare.io/api/proxy/list/?page_size={PROXY_FETCH_COUNT}"
     headers = {"Authorization": f"Token {WEBSHARE_API_KEY}"}
     async with aiohttp.ClientSession() as session:
-        async with session.get(PROXY_FETCH_URL, headers=headers, params={"limit": PROXY_LIMIT, "type": "http"}) as resp:
+        async with session.get(url, headers=headers) as resp:
             data = await resp.json()
             proxies = []
             for item in data.get("results", []):
-                proxy = f"http://{item['username']}:{item['password']}@{item['proxy_address']}:{item['ports']['http']}"
-                proxies.append(proxy)
+                ip = item.get("proxy_address")
+                port = item.get("proxy_port")
+                user = item.get("proxy_username")
+                password = item.get("proxy_password")
+                proxy_str = f"http://{user}:{password}@{ip}:{port}"
+                proxies.append(proxy_str)
             return proxies
 
-async def send_discord_alert(username):
-    content = f"✅ Available username: **{username}**"
+# Send message to Discord webhook
+async def send_discord_message(content):
     async with aiohttp.ClientSession() as session:
-        await session.post(WEBHOOK_URL, json={"content": content})
+        json = {"content": content}
+        async with session.post(WEBHOOK_URL, json=json) as resp:
+            if resp.status != 204:
+                print(f"Failed to send webhook message: {resp.status}")
 
-async def check_username(session, username, proxy):
-    url = f"https://kick.com/{username}"
-    for attempt in range(MAX_RETRIES):
+# Dummy username availability check (replace with actual API call)
+async def check_username(username, proxy):
+    # Simulate a request with proxy here, real logic depends on target API
+    await asyncio.sleep(0.1)  # simulate network delay
+    # Randomly simulate availability
+    available = random.choice([True, False, False])
+    return available
+
+async def worker(queue, proxies):
+    while not queue.empty():
+        username = await queue.get()
+        proxy = random.choice(proxies) if proxies else None
         try:
-            async with session.get(url, proxy=proxy, timeout=10) as resp:
-                if resp.status == 404:
-                    await send_discord_alert(username)
-                    return True
-                elif resp.status == 200:
-                    return False
-                else:
-                    # unexpected status, retry
-                    await asyncio.sleep(1)
-        except Exception:
-            await asyncio.sleep(1)
-    return False
-
-async def worker(name, usernames, proxies):
-    async with aiohttp.ClientSession() as session:
-        for username in usernames:
-            proxy = random.choice(proxies) if proxies else None
-            available = await check_username(session, username, proxy)
-            print(f"[{name}] Checked {username}: {'Available' if available else 'Taken or Error'}")
-            await asyncio.sleep(RATE_LIMIT_DELAY)
+            available = await check_username(username, proxy)
+            if available:
+                await send_discord_message(f"Username available: {username}")
+                print(f"Available: {username}")
+            else:
+                print(f"Taken: {username}")
+            await asyncio.sleep(CHECK_DELAY)
+        except Exception as e:
+            print(f"Error checking {username}: {e}")
+        queue.task_done()
 
 async def main():
-    wordlist_files = [
-        "Brandable.txt", "Culture.txt", "Gaming.txt", 
-        "Mythology.txt", "Nature.txt", "Philosophy.txt", "Tech.txt"
-    ]
-    all_usernames = []
-    for filename in wordlist_files:
-        if os.path.isfile(filename):
-            print(f"Loading {filename}...")
-            with open(filename, "r", encoding="utf-8") as f:
-                all_usernames.extend([line.strip() for line in f if line.strip()])
+    await send_discord_message("Checker Started")
 
-    all_usernames = list(set(all_usernames))
-    print(f"Total usernames loaded: {len(all_usernames)}")
+    usernames = load_usernames()
+    print(f"Loaded {len(usernames)} usernames.")
 
     proxies = await fetch_proxies()
     print(f"Fetched {len(proxies)} proxies.")
 
-    worker_count = 10
-    chunk_size = len(all_usernames) // worker_count
-    tasks = []
-    for i in range(worker_count):
-        chunk = all_usernames[i*chunk_size : (i+1)*chunk_size] if i < worker_count - 1 else all_usernames[i*chunk_size :]
-        tasks.append(asyncio.create_task(worker(f"Worker-{i+1}", chunk, proxies)))
+    queue = asyncio.Queue()
+    for username in usernames:
+        queue.put_nowait(username)
 
-    await asyncio.gather(*tasks)
+    # Run workers (threads)
+    workers = []
+    for _ in range(20):  # number of concurrent workers, tweak as needed
+        workers.append(asyncio.create_task(worker(queue, proxies)))
+
+    await queue.join()
+
+    for w in workers:
+        w.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
