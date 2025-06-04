@@ -22,7 +22,7 @@ PROXY_PORT = os.getenv("PROXY_PORT")
 # ========== BOT SETUP ==========
 COMMAND_PREFIX = '.'
 intents = discord.Intents.default()
-intents.message_content = True  # Important: to receive message content for commands
+intents.message_content = True  # Required to read user messages for commands
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
@@ -51,9 +51,19 @@ class Proxy:
     def update(self, response_time, success):
         self.total += 1
         self.last_used = time.time()
-        self.response_time += response_time
+        if response_time:
+            self.response_time += response_time
         if success:
             self.hits += 1
+
+        # Proxy health logging:
+        print(
+            f"[Proxy Health] {self.proxy_str.split('@')[-1]} | "
+            f"Health: {self.health:.1f}% | "
+            f"Hits: {self.hits} | "
+            f"Total: {self.total} | "
+            f"Avg RT: {self.avg_response:.2f}s"
+        )
 
 class ProxyManager:
     def __init__(self):
@@ -65,20 +75,23 @@ class ProxyManager:
             headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
             async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
                 data = await r.json()
-                # Return proxies formatted for aiohttp proxy arg
-                return [
-                    f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-                    for _ in data["results"]
-                ]
+                # Build proxies list with auth from env vars:
+                proxies_list = []
+                for proxy_data in data.get("results", []):
+                    ip = proxy_data.get("proxy_address")
+                    port = proxy_data.get("proxy_port")
+                    if ip and port:
+                        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}"
+                        proxies_list.append(proxy_url)
+                return proxies_list
 
     async def load(self):
         fresh = await self.fetch()
         async with self.lock:
-            # Add only new proxies
             for p in fresh:
                 if p not in [x.proxy_str for x in self.proxies]:
                     self.proxies.append(Proxy(p))
-            # Keep only the last PROXY_MAX proxies
+            # Keep only the last PROXY_MAX proxies (trim oldest if too many)
             self.proxies = self.proxies[-PROXY_MAX:]
 
     async def get(self):
@@ -94,9 +107,7 @@ class ProxyManager:
         await self.load()
 
 proxy_manager = ProxyManager()
-
-checked = 0
-available = []
+checked, available = 0, []
 checker_running = False
 
 def generate_usernames(n):
@@ -104,11 +115,11 @@ def generate_usernames(n):
     return [random.choice(base) + str(random.randint(1, 9999)) for _ in range(n)]
 
 async def check_username(username):
-    global proxy_manager
     for attempt in range(MAX_ATTEMPTS):
         proxy_obj = await proxy_manager.get()
         if not proxy_obj:
             return False
+
         start = time.time()
         success = False
         try:
@@ -116,7 +127,7 @@ async def check_username(username):
                 async with session.get(f"https://kick.com/{username}", proxy=proxy_obj.proxy_str, timeout=10) as r:
                     if r.status == 404:
                         success = True
-        except:
+        except Exception as e:
             pass
         elapsed = time.time() - start
         proxy_obj.update(elapsed, success)
@@ -127,8 +138,8 @@ async def check_username(username):
 async def run_checker(channel):
     global checked, available, checker_running
     checked, available = 0, []
-    usernames = generate_usernames(CHECK_LIMIT)
     checker_running = True
+    usernames = generate_usernames(CHECK_LIMIT)
     for name in usernames:
         if not checker_running:
             break
@@ -138,7 +149,7 @@ async def run_checker(channel):
         checked += 1
         await asyncio.sleep(0.3)
     checker_running = False
-    await channel.send("*Checker finished*")
+    await channel.send("*Checking complete*")
 
 @bot.event
 async def on_ready():
@@ -153,9 +164,10 @@ async def kickstart(ctx):
         return
     await ctx.send("*Checking Kick Users*")
     channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx.channel
+    await channel.send("*Checking Kick Users*")
     await run_checker(channel)
 
-@bot.command(name="kickstop")
+@bot.command(name='kickstop')
 async def kickstop(ctx):
     global checker_running
     if not checker_running:
@@ -167,14 +179,15 @@ async def kickstop(ctx):
 
 @bot.command(name="kickstatus")
 async def kickstatus(ctx):
-    sample = "\n".join(
-        f"{p.proxy_str[-10:]} | Health: {p.health:.1f}% | Avg RT: {p.avg_response:.2f}s"
-        for p in proxy_manager.proxies[:5]
+    sample = proxy_manager.proxies[:5]
+    text = "\n".join(
+        f"{p.proxy_str.split('@')[-1]} | Health: {p.health:.1f}% | Hits: {p.hits} | Total: {p.total} | Avg RT: {p.avg_response:.2f}s"
+        for p in sample
     )
     await ctx.send(
         f"✅ Checked: {checked}/{CHECK_LIMIT}\n"
         f"🎯 Hits: {len(available)}\n"
-        f"🧠 Proxy Sample:\n{sample}"
+        f"🧠 Proxy Sample:\n{text}"
     )
 
 if __name__ == "__main__":
