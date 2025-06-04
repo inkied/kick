@@ -7,17 +7,6 @@ import random
 from discord.ext import commands
 from dotenv import load_dotenv
 
-load_dotenv()
-
-import os
-import asyncio
-import aiohttp
-import discord
-import time
-import random
-from discord.ext import commands
-from dotenv import load_dotenv
-
 # Load .env variables
 load_dotenv()
 
@@ -144,13 +133,11 @@ async def on_ready():
     print(f"[Discord] Bot connected as {bot.user}")
     await proxy_manager.load()
 
-@bot.command(name='kickstart')
+@bot.command(name="kickstart")
 async def kickstart(ctx):
-    global checker_running
-    if checker_running:
-        await ctx.send("Checker is already running.")
-        return
-
+    print("kickstart command triggered!")  # Debug output to console
+    await ctx.send("*Checking Kick Users*")  # Reply where command was issued
+    # Your checking code here...
     checker_running = True
 
     # Send start message to the command channel or specific channel
