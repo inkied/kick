@@ -12,8 +12,6 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 WEBSHARE_API_KEY = os.getenv("WEBSHARE_API_KEY")
 
-WORDLIST_FILES = ["Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt", "Nature.txt", "Philosophy.txt", "Tech.txt"]
-
 MAX_CONCURRENT_CHECKS = 20
 DISCORD_MESSAGE_DELAY = 2  # seconds between Discord messages
 
@@ -32,72 +30,71 @@ check_task = None
 current_index = 0
 
 async def fetch_proxies():
-    global proxies
-    url = f"https://proxy.webshare.io/api/proxy/list/?page=1&page_size=100&country=all"
+    url = "https://proxy.webshare.io/api/proxy/list/"
     headers = {"Authorization": f"ApiKey {WEBSHARE_API_KEY}"}
+    proxies_list = []
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                proxy_list = data.get("results", [])
-                proxies = []
-                for proxy in proxy_list:
-                    # Format: http://user:pass@host:port
-                    proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['proxy_address']}:{proxy['ports']['http']}"
-                    proxies.append(proxy_url)
-                print(f"Loaded {len(proxies)} proxies from Webshare.")
-            else:
-                print(f"Failed to fetch proxies, status code: {resp.status}")
-
-def get_next_proxy():
-    global proxy_index
-    proxy = proxies[proxy_index]
-    proxy_index = (proxy_index + 1) % len(proxies)
-    return proxy
+                for item in data.get("results", []):
+                    # Build HTTP proxy string, you can adjust for SOCKS if needed
+                    proxy = f"http://{item['username']}:{item['password']}@{item['proxy_address']}:{item['ports']['http']}"
+                    proxies_list.append(proxy)
+    return proxies_list
 
 async def load_wordlist():
     usernames = set()
-    for file in WORDLIST_FILES:
-        if os.path.exists(file):
-            with open(file, "r", encoding="utf-8") as f:
-                usernames.update(line.strip().lower() for line in f if line.strip())
+    if os.path.exists("users.txt"):
+        with open("users.txt", "r", encoding="utf-8") as f:
+            usernames.update(line.strip().lower() for line in f if line.strip())
     return list(usernames)
+
+async def get_next_proxy():
+    global proxy_index
+    async with proxy_lock:
+        proxy = proxies[proxy_index]
+        proxy_index = (proxy_index + 1) % len(proxies)
+        return proxy
 
 async def check_username(session, username):
     global available_count
-    proxy_url = get_next_proxy()
+    proxy = await get_next_proxy()
     try:
-        async with session.get(f"https://kick.com/api/v1/channels/{username}", proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        url = f"https://kick.com/api/v1/channels/{username}"
+        async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 404:
                 available_count += 1
                 await send_available(username)
-            # 200 means taken, do nothing
+            # 200 = taken, do nothing
     except Exception:
-        # ignore errors silently or log if you want
+        # ignore network errors or timeouts silently to keep speed
         pass
 
 async def send_available(username):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    embed = discord.Embed(
-        title=f"Check @{username}",
-        description=f"Username `{username}` is available on Kick.com!",
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
-    )
-    embed.set_footer(text="By Kick")
-    await channel.send(embed=embed)
-    await asyncio.sleep(DISCORD_MESSAGE_DELAY)
+    if channel:
+        embed = discord.Embed(
+            title=f"Check @{username}",
+            description=f"Username `{username}` is available on Kick.com!",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text="By Kick")
+        await channel.send(embed=embed)
+        await asyncio.sleep(DISCORD_MESSAGE_DELAY)
 
 async def send_progress():
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    embed = discord.Embed(
-        title="Checker Progress",
-        description=f"Checked {checked_count}/{len(wordlist)} usernames.",
-        color=discord.Color.blue(),
-        timestamp=datetime.utcnow()
-    )
-    embed.set_footer(text="By Kick")
-    await channel.send(embed=embed)
+    if channel:
+        embed = discord.Embed(
+            title="Checker Progress",
+            description=f"Checked {checked_count}/{len(wordlist)} usernames.",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text="By Kick")
+        await channel.send(embed=embed)
 
 async def checker_loop():
     global checked_count, checking, current_index
@@ -111,7 +108,7 @@ async def checker_loop():
             current_index += len(batch)
             if checked_count % 50 == 0 or current_index >= len(wordlist):
                 await send_progress()
-            await asyncio.sleep(1)  # small delay to protect proxies
+            await asyncio.sleep(1)  # small delay to avoid proxy stress
     checking = False
 
 @bot.command()
@@ -139,11 +136,15 @@ async def stop(ctx):
 
 @bot.event
 async def on_ready():
-    global wordlist
+    global wordlist, proxies
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    proxies = await fetch_proxies()
+    if not proxies:
+        print("No proxies loaded! Please check your Webshare API key.")
+        return
+    print(f"Loaded {len(proxies)} proxies from Webshare.")
     wordlist = await load_wordlist()
-    print(f"Loaded {len(wordlist)} usernames from wordlists.")
-    await fetch_proxies()  # fetch proxies on startup
+    print(f"Loaded {len(wordlist)} usernames from users.txt.")
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
         await channel.send("Checker bot is online and ready! Use `/start` to begin.")
