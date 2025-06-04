@@ -1,14 +1,15 @@
-FROM python:3.10-slim
+# Use official Python slim image
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy your script and any other files
-COPY . .
-
-# Copy requirements and install dependencies
+# Copy requirements and script
 COPY requirements.txt .
+COPY username_checker.py .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Run your script
+# Run the checker script
 CMD ["python", "kick.py"]
