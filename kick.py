@@ -24,9 +24,9 @@ from discord.ext import commands
 COMMAND_PREFIX = '.'
 
 intents = discord.Intents.default()
-intents.message_content = True  # ✅ Enable this line
+intents.message_content = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+bot = commands.Bot(command_prefix='.', intents=intents)
 
 # ========== CONFIG ==========
 MAX_ATTEMPTS = 4
