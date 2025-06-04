@@ -18,8 +18,14 @@ PROXY_PASS = os.getenv("PROXY_PASS")
 PROXY_HOST = os.getenv("PROXY_HOST")
 PROXY_PORT = os.getenv("PROXY_PORT")
 
+import discord
+from discord.ext import commands
+
 COMMAND_PREFIX = '.'
+
 intents = discord.Intents.default()
+intents.message_content = True  # ✅ Enable this line
+
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 # ========== CONFIG ==========
