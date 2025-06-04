@@ -1,206 +1,255 @@
-import os
-import asyncio
-import aiohttp
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
-
-load_dotenv()
-
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
-WEBSHARE_API_KEY = os.getenv("WEBSHARE_API_KEY")
-
-MAX_CONCURRENT_CHECKS = 20
-DISCORD_MESSAGE_DELAY = 2  # seconds between Discord messages
+import asyncio
+import aiohttp
+import time
+import random
 
 intents = discord.Intents.default()
-intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-bot = commands.Bot(command_prefix="/", intents=intents)
+# ======= Config =======
+USERS_TO_CHECK = 100  # Adjust this to your full username list length
+MAX_ATTEMPTS_PER_USERNAME = 5
+MIN_PROXIES = 10
+MAX_PROXIES = 50
 
-proxies = []
-proxy_index = 0
-proxy_lock = asyncio.Lock()
+# Control variables for running/stopping
+checker_task = None
+stop_flag = False
 
-wordlist = []
-checked_count = 0
-available_count = 0
-checking = False
-check_task = None
-current_index = 0
-
-proxy_response_times = []
-proxy_response_lock = asyncio.Lock()
-
-check_start_time = None
-
+# Dummy proxy fetch function — replace with your real proxy API or file logic
 async def fetch_proxies():
-    url = "https://proxy.webshare.io/api/proxy/list/"
-    headers = {"Authorization": f"ApiKey {WEBSHARE_API_KEY}"}
-    proxies_list = []
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                for item in data.get("results", []):
-                    proxy = f"http://{item['username']}:{item['password']}@{item['proxy_address']}:{item['ports']['http']}"
-                    proxies_list.append(proxy)
-    return proxies_list
+    await asyncio.sleep(1)
+    return [
+        "http://proxy1:port",
+        "http://proxy2:port",
+        # Add your proxies here
+    ]
 
-async def load_wordlist():
-    usernames = set()
-    if os.path.exists("users.txt"):
-        with open("users.txt", "r", encoding="utf-8") as f:
-            usernames.update(line.strip().lower() for line in f if line.strip())
-    return list(usernames)
+# ======= Proxy management =======
+class Proxy:
+    def __init__(self, proxy_str):
+        self.proxy_str = proxy_str
+        self.hits = 0
+        self.requests = 0
+        self.total_response_time = 0
+        self.first_used = time.time()
+        self.last_used = time.time()
+        self.status = "Fast"  # Fast, Slow, Bad
 
-async def get_next_proxy():
-    global proxy_index
-    async with proxy_lock:
-        proxy = proxies[proxy_index]
-        proxy_index = (proxy_index + 1) % len(proxies)
-        return proxy
+    @property
+    def hit_rate(self):
+        return self.hits / self.requests if self.requests > 0 else 0
 
-async def check_username(session, username):
-    global available_count
-    proxy = await get_next_proxy()
-    start = datetime.utcnow()
-    try:
-        url = f"https://kick.com/api/v1/channels/{username}"
-        async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            elapsed = (datetime.utcnow() - start).total_seconds()
-            # Track proxy response time
-            async with proxy_response_lock:
-                proxy_response_times.append(elapsed)
-                if len(proxy_response_times) > 50:
-                    proxy_response_times.pop(0)
-            if resp.status == 404:
-                available_count += 1
-                await send_available(username)
-    except Exception:
-        pass
+    @property
+    def avg_response_time(self):
+        return self.total_response_time / self.requests if self.requests > 0 else float('inf')
 
-async def send_available(username):
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if channel:
-        embed = discord.Embed(
-            title=f"Check @{username}",
-            description=f"Username `{username}` is available on Kick.com!",
-            color=discord.Color.green(),
-            timestamp=datetime.utcnow()
-        )
-        embed.set_footer(text="By Kick")
-        await channel.send(embed=embed)
-        await asyncio.sleep(DISCORD_MESSAGE_DELAY)
+    @property
+    def life_time(self):
+        return time.time() - self.first_used
 
-async def send_progress():
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if channel:
-        embed = discord.Embed(
-            title="Checker Progress",
-            description=f"Checked {checked_count}/{len(wordlist)} usernames.",
-            color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
-        )
-        embed.set_footer(text="By Kick")
-        await channel.send(embed=embed)
+    def update_stats(self, response_time, success):
+        self.requests += 1
+        self.last_used = time.time()
+        self.total_response_time += response_time
+        if success:
+            self.hits += 1
+        self.evaluate_status()
 
-async def checker_loop():
-    global checked_count, checking, current_index, check_start_time
-    check_start_time = datetime.utcnow()
-    connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT_CHECKS)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while checking and current_index < len(wordlist):
-            batch = wordlist[current_index:current_index + MAX_CONCURRENT_CHECKS]
-            tasks = [check_username(session, username) for username in batch]
-            await asyncio.gather(*tasks)
-            checked_count += len(batch)
-            current_index += len(batch)
-            if checked_count % 50 == 0 or current_index >= len(wordlist):
-                await send_progress()
-            await asyncio.sleep(1)
-    checking = False
-
-@bot.command()
-async def start(ctx):
-    global checking, check_task, checked_count, available_count, current_index
-    if checking:
-        await ctx.send("Checker is already running.")
-        return
-    if current_index >= len(wordlist):
-        checked_count = 0
-        available_count = 0
-        current_index = 0
-    checking = True
-    await ctx.send(f"Checker started! Total usernames: {len(wordlist)}")
-    check_task = asyncio.create_task(checker_loop())
-
-@bot.command()
-async def stop(ctx):
-    global checking
-    if not checking:
-        await ctx.send("Checker is not running.")
-        return
-    checking = False
-    await ctx.send("Checker stopped. You can resume with `/start`.")
-
-@bot.command()
-async def status(ctx):
-    if not wordlist:
-        await ctx.send("Wordlist not loaded yet.")
-        return
-    elapsed = (datetime.utcnow() - check_start_time).total_seconds() if check_start_time else 0
-    rate = checked_count / elapsed if elapsed > 0 else 0
-    remaining = len(wordlist) - checked_count
-    eta_seconds = remaining / rate if rate > 0 else -1
-
-    # Average proxy response time
-    async with proxy_response_lock:
-        if proxy_response_times:
-            avg_response = sum(proxy_response_times) / len(proxy_response_times)
+    def evaluate_status(self):
+        if self.requests < 5:
+            self.status = "Fast"
+            return
+        if self.avg_response_time > 3:
+            self.status = "Bad"
+        elif self.avg_response_time > 1.5:
+            self.status = "Slow" if self.hit_rate >= 0.6 else "Bad"
         else:
-            avg_response = 0
+            self.status = "Fast"
 
-    # Proxy health status based on avg response time
-    if avg_response == 0:
-        health = "No proxy data yet"
-    elif avg_response < 1:
-        health = "Fast"
-    elif avg_response < 3:
-        health = "Okay"
-    else:
-        health = "Slow"
+class ProxyManager:
+    def __init__(self, min_proxies=MIN_PROXIES, max_proxies=MAX_PROXIES):
+        self.proxies = []
+        self.min_proxies = min_proxies
+        self.max_proxies = max_proxies
+        self.lock = asyncio.Lock()
 
-    eta_str = str(timedelta(seconds=int(eta_seconds))) if eta_seconds > 0 else "Unknown"
+    async def load_proxies(self):
+        fresh_proxy_strs = await fetch_proxies()
+        async with self.lock:
+            for p_str in fresh_proxy_strs:
+                if not any(p.proxy_str == p_str for p in self.proxies):
+                    self.proxies.append(Proxy(p_str))
+        print(f"[ProxyManager] Loaded {len(fresh_proxy_strs)} fresh proxies.")
 
-    embed = discord.Embed(
-        title="Checker Status",
-        color=discord.Color.gold(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="Checked", value=f"{checked_count} / {len(wordlist)}", inline=True)
-    embed.add_field(name="Available Found", value=str(available_count), inline=True)
-    embed.add_field(name="Proxy Health", value=health, inline=True)
-    embed.add_field(name="Avg Proxy Response", value=f"{avg_response:.2f} sec", inline=True)
-    embed.add_field(name="Estimated Time Left", value=eta_str, inline=True)
-    await ctx.send(embed=embed)
+    async def get_best_proxy(self):
+        async with self.lock:
+            fast = [p for p in self.proxies if p.status == "Fast"]
+            slow = [p for p in self.proxies if p.status == "Slow" and p.hit_rate >= 0.6]
+            candidates = fast + slow
 
+            if not candidates:
+                await self.restock_proxies()
+                fast = [p for p in self.proxies if p.status == "Fast"]
+                if not fast:
+                    raise Exception("No valid proxies available after restock")
+                candidates = fast
+
+            # Prioritize by life_time and hit_rate
+            candidates.sort(key=lambda p: (p.life_time, p.hit_rate), reverse=True)
+            return candidates[0]
+
+    async def restock_proxies(self):
+        async with self.lock:
+            if len(self.proxies) >= self.min_proxies:
+                return
+            print("[ProxyManager] Restocking proxies...")
+            fresh_proxy_strs = await fetch_proxies()
+            fresh_proxies = [Proxy(p) for p in fresh_proxy_strs if p not in [x.proxy_str for x in self.proxies]]
+            space_left = self.max_proxies - len(self.proxies)
+            self.proxies.extend(fresh_proxies[:space_left])
+            print(f"[ProxyManager] Restocked with {len(fresh_proxies[:space_left])} proxies.")
+
+    async def cleanup_bad_proxies(self):
+        async with self.lock:
+            before = len(self.proxies)
+            self.proxies = [p for p in self.proxies if p.status != "Bad"]
+            after = len(self.proxies)
+            if before != after:
+                print(f"[ProxyManager] Removed {before - after} bad proxies.")
+
+    async def update_proxy_stats(self, proxy_str, response_time, success):
+        async with self.lock:
+            for proxy in self.proxies:
+                if proxy.proxy_str == proxy_str:
+                    proxy.update_stats(response_time, success)
+                    break
+        await self.cleanup_bad_proxies()
+        if len(self.proxies) < self.min_proxies:
+            await self.restock_proxies()
+
+proxy_manager = ProxyManager()
+
+# ======= Username checker =======
+users_checked = 0
+hits = []  # list of dicts: {'username', 'timestamp', 'tries'}
+
+# Sample Kick username generator (replace with your real one)
+def generate_usernames(n):
+    base_words = ["gamer", "tech", "stream", "pro", "kick", "live", "zone", "chat", "play", "cast"]
+    usernames = []
+    while len(usernames) < n:
+        word = random.choice(base_words)
+        if any(c.isdigit() or c == '_' for c in word):
+            continue
+        usernames.append(word + str(random.randint(1,999)))
+    return usernames
+
+async def check_username(username):
+    global users_checked
+    tries = 0
+    while tries < MAX_ATTEMPTS_PER_USERNAME:
+        if stop_flag:
+            break
+        tries += 1
+        proxy = await proxy_manager.get_best_proxy()
+        proxy_url = proxy.proxy_str
+        start = time.time()
+        success = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://kick.com/{username}", proxy=proxy_url, timeout=10) as resp:
+                    if resp.status == 404:  # Username available
+                        success = True
+        except Exception:
+            pass
+        response_time = time.time() - start
+        await proxy_manager.update_proxy_stats(proxy_url, response_time, success)
+        if success:
+            hits.append({'username': username, 'timestamp': time.time(), 'tries': tries})
+            break
+    users_checked += 1
+    return success
+
+async def run_checker():
+    global users_checked, stop_flag
+    users_checked = 0
+    hits.clear()
+    usernames = generate_usernames(USERS_TO_CHECK)
+    stop_flag = False
+    for username in usernames:
+        if stop_flag:
+            print("[Checker] Stopped by user.")
+            break
+        await check_username(username)
+        await asyncio.sleep(0.1)  # small delay to prevent hammering
+
+# ======= Discord commands =======
 @bot.event
 async def on_ready():
-    global wordlist, proxies
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    proxies = await fetch_proxies()
-    if not proxies:
-        print("No proxies loaded! Please check your Webshare API key.")
-        return
-    print(f"Loaded {len(proxies)} proxies from Webshare.")
-    wordlist = await load_wordlist()
-    print(f"Loaded {len(wordlist)} usernames from users.txt.")
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if channel:
-        await channel.send("Checker bot is online and ready! Use `/start` to begin.")
+    print(f"[Discord] Logged in as {bot.user} (ID: {bot.user.id})")
+    await proxy_manager.load_proxies()
 
+@bot.slash_command(name="kickstart", description="Start the Kick username checker")
+async def kickstart(ctx):
+    global checker_task, stop_flag
+    if checker_task and not checker_task.done():
+        await ctx.respond("Checker is already running.")
+        return
+    stop_flag = False
+    await ctx.respond("Starting Kick username checker...")
+    checker_task = asyncio.create_task(run_checker())
+
+@bot.slash_command(name="kickstop", description="Stop the Kick username checker")
+async def kickstop(ctx):
+    global stop_flag
+    if not checker_task or checker_task.done():
+        await ctx.respond("Checker is not running.")
+        return
+    stop_flag = True
+    await ctx.respond("Stopping Kick username checker...")
+
+@bot.slash_command(name="kickstatus", description="Show current status of Kick checker")
+async def kickstatus(ctx):
+    fast_count = slow_count = bad_count = 0
+    total_requests = total_response = 0
+    async with proxy_manager.lock:
+        for p in proxy_manager.proxies:
+            total_requests += p.requests
+            total_response += p.total_response_time
+            if p.status == "Fast":
+                fast_count += 1
+            elif p.status == "Slow":
+                slow_count += 1
+            elif p.status == "Bad":
+                bad_count += 1
+
+    avg_response_time = (total_response / total_requests) if total_requests else 0
+    remaining = max(USERS_TO_CHECK - users_checked, 0)
+    est_seconds_left = remaining * (avg_response_time + 0.1)  # rough estimate including delay
+    est_minutes, est_seconds = divmod(est_seconds_left, 60)
+
+    hits_text = ""
+    for hit in hits[-10:]:  # Show last 10 hits
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(hit['timestamp']))
+        hits_text += f"• {hit['username']} | Available at {ts} | Attempts: {hit['tries']}\n"
+
+    await ctx.respond(
+        f"**Kick Username Checker Status**\n"
+        f"Users checked: {users_checked} of {USERS_TO_CHECK}\n"
+        f"Hits found: {len(hits)}\n"
+        f"Recent hits:\n{hits_text or 'No hits yet.'}\n"
+        f"Proxy health:\n"
+        f"Fast: {fast_count}\n"
+        f"Slow: {slow_count}\n"
+        f"Bad: {bad_count}\n"
+        f"Average proxy response time: {avg_response_time:.2f} sec\n"
+        f"Estimated time left: {int(est_minutes)}m {int(est_seconds)}s"
+    )
+
+# ======= Run bot =======
 if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
+    TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
+    bot.run(TOKEN)
