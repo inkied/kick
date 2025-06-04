@@ -7,7 +7,6 @@ import random
 from discord.ext import commands
 from dotenv import load_dotenv
 from datetime import datetime
-import pytz
 
 load_dotenv()
 
@@ -20,17 +19,14 @@ PROXY_PASS = os.getenv("PROXY_PASS")
 
 # ========== CONFIG ==========
 COMMAND_PREFIX = '.'
-MAX_ATTEMPTS = 1  # No retry on username, skip if fail once
-CHECK_LIMIT = 100  # Batch size
+CHECK_LIMIT = 100
 PROXY_MIN = 10
 PROXY_MAX = 50
 GOOD_PROXIES_FILE = "proxies.txt"
-PROXY_HEALTH_THRESHOLD = 50  # Only use proxies with health > 50%
-PROXY_BACKOFF = 10  # seconds cooldown for proxy reuse
-AVG_DELAY = 0.85  # Average delay per check for estimated time calculation
-
-# Local timezone for timestamping
-LOCAL_TIMEZONE = pytz.timezone("America/New_York")  # Eastern Time for Tennessee
+PROXY_HEALTH_THRESHOLD = 50  # Use proxies with health > 50%
+PROXY_BACKOFF = 10  # seconds to cool down a proxy with low health
+USERS_FILE = "users.txt"
+HITS_FILE = "hits.txt"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -62,7 +58,6 @@ class Proxy:
         if success:
             self.hits += 1
 
-        # Mark proxy as bad if health < threshold and used enough times
         if self.total >= PROXY_MIN and self.health < PROXY_HEALTH_THRESHOLD:
             self.is_good = False
 
@@ -92,7 +87,6 @@ class ProxyManager:
                 return proxies_list
 
     async def load(self):
-        # Load saved good proxies first
         loaded = self.load_good_proxies()
         async with self.lock:
             self.proxies = loaded
@@ -112,7 +106,6 @@ class ProxyManager:
 
     def load_good_proxies(self):
         if not os.path.exists(GOOD_PROXIES_FILE):
-            print(f"[ProxyManager] No proxies.txt found to load.")
             return []
         with open(GOOD_PROXIES_FILE, "r") as f:
             lines = [line.strip() for line in f if line.strip()]
@@ -134,48 +127,25 @@ class ProxyManager:
             return random.choice(valid)
 
 proxy_manager = ProxyManager()
-
-checked = 0
-available = []
+checked, available = 0, []
 checker_running = False
 
-def load_usernames_from_file(filename="users.txt"):
-    if not os.path.exists(filename):
-        print(f"[Usernames] {filename} not found. Creating new file.")
-        open(filename, "w").close()
-        return []
-    with open(filename, "r") as f:
-        users = [line.strip() for line in f if line.strip()]
-    print(f"[Usernames] Loaded {len(users)} usernames from {filename}")
-    return users
-
-def append_usernames_to_file(usernames, filename="users.txt"):
-    with open(filename, "a") as f:
-        for u in usernames:
-            f.write(u + "\n")
-
-def save_hits(usernames, filename="hits.txt"):
-    with open(filename, "a") as f:
-        for u in usernames:
-            f.write(u + "\n")
-
 def generate_usernames(n):
-    # Mix of semi-OG words, short users, brandables (customize your list here)
-    base_words = [
-        "stream", "kick", "zone", "live", "play", "cult", "digi", "vibe", "wave", "flux",
-        "nova", "pulse", "echo", "drift", "luxe", "glow", "rise", "prime", "core", "shift"
-    ]
-    usernames = []
+    base = ["live", "chat", "play", "stream", "kick", "zone", "cult", "digi"]
+    new_users = []
     for _ in range(n):
-        word = random.choice(base_words)
-        suffix = str(random.randint(1, 9999))
-        usernames.append(word + suffix)
-    return usernames
+        name = random.choice(base) + str(random.randint(1, 9999))
+        new_users.append(name)
+    # Append to users.txt
+    with open(USERS_FILE, "a") as f:
+        for user in new_users:
+            f.write(user + "\n")
+    print(f"[UsernameGen] Added {n} new usernames to {USERS_FILE}")
+    return new_users
 
 async def check_username(username):
     proxy_obj = await proxy_manager.get()
     if not proxy_obj:
-        print("[Checker] No proxy available for checking.")
         return False
     start = time.time()
     success = False
@@ -192,70 +162,87 @@ async def check_username(username):
 
 async def run_checker(channel):
     global checked, available, checker_running
+    checked, available = 0, []
     checker_running = True
-    total_checked = 0
-    total_hits = 0
 
     while checker_running:
-        # Load usernames batch
-        usernames = load_usernames_from_file()
-        if len(usernames) < CHECK_LIMIT:
-            # Generate more usernames and append
-            new_users = generate_usernames(CHECK_LIMIT - len(usernames))
-            append_usernames_to_file(new_users)
-            usernames += new_users
+        # Load current usernames from users.txt
+        if not os.path.exists(USERS_FILE):
+            print(f"[Checker] {USERS_FILE} not found, generating initial usernames...")
+            usernames = generate_usernames(CHECK_LIMIT)
+        else:
+            with open(USERS_FILE, "r") as f:
+                usernames = [line.strip() for line in f if line.strip()]
+            if len(usernames) < CHECK_LIMIT:
+                to_generate = CHECK_LIMIT - len(usernames)
+                print(f"[Checker] Not enough usernames ({len(usernames)}), generating {to_generate} new ones.")
+                new_users = generate_usernames(to_generate)
+                usernames.extend(new_users)
 
-        batch = usernames[:CHECK_LIMIT]
+        print(f"[Checker] Starting batch of {CHECK_LIMIT} usernames at {datetime.now().strftime('%H:%M:%S')}")
+        await channel.send(f"🚀 Starting new batch of {CHECK_LIMIT} usernames at {datetime.now().strftime('%H:%M:%S')}")
 
-        # Remove batch from users.txt (keep rest)
-        rest = usernames[CHECK_LIMIT:]
-        with open("users.txt", "w") as f:
-            for u in rest:
-                f.write(u + "\n")
+        batch_users = usernames[:CHECK_LIMIT]
+        # Remove batch from users.txt
+        with open(USERS_FILE, "w") as f:
+            for user in usernames[CHECK_LIMIT:]:
+                f.write(user + "\n")
 
-        # Print batch start info
-        now_str = datetime.now(LOCAL_TIMEZONE).strftime("%H:%M:%S")
-        est_time = CHECK_LIMIT * AVG_DELAY
-        await channel.send(f"🔄 Starting new batch at {now_str} with {CHECK_LIMIT} usernames")
-        await channel.send(f"⏱ Estimated time to check: {est_time:.1f} seconds")
+        checked, available = 0, []
 
-        batch_hits = []
-        batch_checked = 0
-
-        for username in batch:
+        start_time = time.time()
+        for name in batch_users:
             if not checker_running:
                 break
-            is_available = await check_username(username)
-            if is_available:
-                batch_hits.append(username)
-                total_hits += 1
-                await channel.send(f"✅ Available: `{username}`")
-            batch_checked += 1
-            total_checked += 1
-            checked = total_checked
+            if await check_username(name):
+                available.append(name)
+                with open(HITS_FILE, "a") as f:
+                    f.write(name + "\n")
+                await channel.send(f"✅ Available: `{name}`")
+            checked += 1
+            elapsed = time.time() - start_time
+            est_remain = (elapsed / checked) * (len(batch_users) - checked) if checked else 0
+            # Status message every 10 checks to avoid spam
+            if checked % 10 == 0:
+                await channel.send(f"⌛ Checked {checked}/{len(batch_users)} — Est. time left: {int(est_remain)}s", delete_after=5)
+            await asyncio.sleep(0.3)
 
-            await asyncio.sleep(0.3)  # Delay between checks
+        duration = time.time() - start_time
+        success_rate = (len(available) / len(batch_users)) * 100 if batch_users else 0
+        await channel.send(
+            f"✅ Batch complete in {int(duration)} seconds.\n"
+            f"🎯 Total Checked: {checked}\n"
+            f"🎯 Total Hits: {len(available)}\n"
+            f"🎯 Success Rate: {success_rate:.2f}%"
+        )
 
-        available.extend(batch_hits)
-        save_hits(batch_hits)
-
-        # Save good proxies after batch
         proxy_manager.save_good_proxies()
 
-        # Batch summary
-        success_rate = (total_hits / total_checked * 100) if total_checked else 0
-        await channel.send(
-            f"✅ Batch complete: Total checked: {total_checked} | Hits: {total_hits} | Success rate: {success_rate:.2f}%"
-        )
+        # Wait a bit before next batch
+        await asyncio.sleep(3)
 
 @bot.event
 async def on_ready():
     print(f"[Discord] Bot connected as {bot.user}")
     await proxy_manager.load()
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if not channel:
-        print("[Discord] Could not find the channel. Please check the ID.")
+
+@bot.command(name="kickstart")
+async def kickstart(ctx):
+    global checker_running
+    if checker_running:
+        await ctx.send("Checker is already running.")
         return
-    await run_checker(channel)
+    await ctx.send("*Checking Kick Users*")
+    channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx
+    asyncio.create_task(run_checker(channel))
+
+@bot.command(name="kickstop")
+async def kickstop(ctx):
+    global checker_running
+    if not checker_running:
+        await ctx.send("Checker is not running.")
+        return
+    checker_running = False
+    await ctx.send("Checker stopped.")
 
 bot.run(DISCORD_TOKEN)
