@@ -22,9 +22,10 @@ PROXY_PORT = os.getenv("PROXY_PORT")
 # ========== BOT SETUP ==========
 COMMAND_PREFIX = '.'
 intents = discord.Intents.default()
-intents.message_content = True  # Required to read user messages for commands
+intents.message_content = True  # Important: to receive message content for commands
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+
 # ========== CONFIG ==========
 MAX_ATTEMPTS = 4
 CHECK_LIMIT = 100
@@ -64,6 +65,7 @@ class ProxyManager:
             headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
             async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
                 data = await r.json()
+                # Return proxies formatted for aiohttp proxy arg
                 return [
                     f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
                     for _ in data["results"]
@@ -72,9 +74,12 @@ class ProxyManager:
     async def load(self):
         fresh = await self.fetch()
         async with self.lock:
+            # Add only new proxies
             for p in fresh:
                 if p not in [x.proxy_str for x in self.proxies]:
                     self.proxies.append(Proxy(p))
+            # Keep only the last PROXY_MAX proxies
+            self.proxies = self.proxies[-PROXY_MAX:]
 
     async def get(self):
         async with self.lock:
@@ -87,21 +92,23 @@ class ProxyManager:
     async def restock(self):
         print("[ProxyManager] Restocking proxies...")
         await self.load()
-        self.proxies = self.proxies[-PROXY_MAX:]
 
 proxy_manager = ProxyManager()
-checked, available = 0, []
+
+checked = 0
+available = []
+checker_running = False
 
 def generate_usernames(n):
     base = ["live", "chat", "play", "stream", "kick", "zone", "cult", "digi"]
     return [random.choice(base) + str(random.randint(1, 9999)) for _ in range(n)]
 
 async def check_username(username):
+    global proxy_manager
     for attempt in range(MAX_ATTEMPTS):
         proxy_obj = await proxy_manager.get()
         if not proxy_obj:
             return False
-
         start = time.time()
         success = False
         try:
@@ -118,15 +125,20 @@ async def check_username(username):
     return False
 
 async def run_checker(channel):
-    global checked, available
+    global checked, available, checker_running
     checked, available = 0, []
     usernames = generate_usernames(CHECK_LIMIT)
+    checker_running = True
     for name in usernames:
+        if not checker_running:
+            break
         if await check_username(name):
             available.append(name)
             await channel.send(f"✅ Available: `{name}`")
         checked += 1
         await asyncio.sleep(0.3)
+    checker_running = False
+    await channel.send("*Checker finished*")
 
 @bot.event
 async def on_ready():
@@ -135,40 +147,34 @@ async def on_ready():
 
 @bot.command(name="kickstart")
 async def kickstart(ctx):
-    print("kickstart command triggered!")  # Debug output to console
-    await ctx.send("*Checking Kick Users*")  # Reply where command was issued
-    # Your checking code here...
-    checker_running = True
-
-    # Send start message to the command channel or specific channel
+    global checker_running
+    if checker_running:
+        await ctx.send("Checker is already running.")
+        return
+    await ctx.send("*Checking Kick Users*")
     channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx.channel
-    await channel.send("*Checking Kick Users*")
+    await run_checker(channel)
 
-    await run_checker()  # Your async checker function
-
-@bot.command(name='kickstop')
+@bot.command(name="kickstop")
 async def kickstop(ctx):
     global checker_running
     if not checker_running:
         await ctx.send("Checker is not running.")
         return
-
     checker_running = False
-
-    # Send stop message
     channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx.channel
     await channel.send("*Checker Stopped*")
 
 @bot.command(name="kickstatus")
 async def kickstatus(ctx):
-    text = "\n".join(
+    sample = "\n".join(
         f"{p.proxy_str[-10:]} | Health: {p.health:.1f}% | Avg RT: {p.avg_response:.2f}s"
         for p in proxy_manager.proxies[:5]
     )
     await ctx.send(
         f"✅ Checked: {checked}/{CHECK_LIMIT}\n"
         f"🎯 Hits: {len(available)}\n"
-        f"🧠 Proxy Sample:\n{text}"
+        f"🧠 Proxy Sample:\n{sample}"
     )
 
 if __name__ == "__main__":
