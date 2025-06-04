@@ -1,63 +1,57 @@
 import os
-import asyncio
 import aiohttp
+import asyncio
 import discord
-import time
 import random
-from discord.ext import commands, tasks
+import time
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
+PROXIES_CHANNEL_ID = int(os.getenv("PROXIES_CHANNEL_ID"))
 WEBSHARE_KEY = os.getenv("WEBSHARE_API_KEY")
 PROXY_USER = os.getenv("PROXY_USER")
 PROXY_PASS = os.getenv("PROXY_PASS")
 
 COMMAND_PREFIX = '.'
+MAX_ATTEMPTS = 3
+CHECK_LIMIT = 100
+PROXY_MAX = 50
+HEALTH_THRESHOLD = 30
+CONCURRENCY_LIMIT = 10
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
-
-# ========= CONFIG =========
-MAX_ATTEMPTS = 3
-CHECK_LIMIT = 100
-MAX_PROXIES = 50
-CONCURRENT_CHECKS = 15
-PROXY_HEALTH_THRESHOLD = 50
-MAX_PROXY_RESPONSE = 5
-RESTOCK_INTERVAL = 300  # every 5 minutes
-BAD_HEALTH_THRESHOLD = 25
-FAILURE_BACKOFF = [0.2, 0.5, 1.0]
 
 class Proxy:
     def __init__(self, proxy_str):
         self.proxy_str = proxy_str
         self.hits = 0
         self.total = 0
-        self.response_time = 0
-        self.last_used = time.time()
+        self.response_time = 0.0
+        self.last_used = 0
 
     @property
     def health(self):
         return round((self.hits / self.total) * 100, 2) if self.total else 100
 
     @property
-    def avg_response(self):
-        return self.response_time / self.total if self.total else 0
+    def avg_rt(self):
+        return round(self.response_time / self.total, 2) if self.total else 0.0
 
-    def update(self, response_time, success):
+    def update(self, rt, success):
         self.total += 1
-        self.last_used = time.time()
-        if response_time:
-            self.response_time += response_time
+        self.response_time += rt
         if success:
             self.hits += 1
-        print(
-            f"[Proxy] {self.proxy_str.split('@')[-1]} | "
-            f"Health: {self.health:.1f}% | Hits: {self.hits} | Total: {self.total} | AvgRT: {self.avg_response:.2f}s"
-        )
+        self.last_used = time.time()
+
+    def is_healthy(self):
+        return self.health >= HEALTH_THRESHOLD
 
 class ProxyManager:
     def __init__(self):
@@ -65,9 +59,10 @@ class ProxyManager:
         self.lock = asyncio.Lock()
 
     async def fetch(self):
+        headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
+        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct"
         async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
-            async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
+            async with session.get(url, headers=headers) as r:
                 data = await r.json()
                 return [
                     f"http://{PROXY_USER}:{PROXY_PASS}@{p['proxy_address']}:{p['port']}"
@@ -80,75 +75,57 @@ class ProxyManager:
             for p in fresh:
                 if p not in [x.proxy_str for x in self.proxies]:
                     self.proxies.append(Proxy(p))
-            self.cleanup()
-            self.proxies = self.proxies[-MAX_PROXIES:]
-
-    def cleanup(self):
-        self.proxies = [
-            p for p in self.proxies
-            if p.health >= BAD_HEALTH_THRESHOLD and p.avg_response < MAX_PROXY_RESPONSE
-        ]
+            self.proxies = self.proxies[-PROXY_MAX:]
 
     async def get(self):
         async with self.lock:
-            valid = sorted(
-                [p for p in self.proxies if p.health >= PROXY_HEALTH_THRESHOLD],
-                key=lambda x: x.avg_response
-            )
-            if not valid:
+            healthy = [p for p in self.proxies if p.is_healthy()]
+            if not healthy:
                 await self.load()
-                valid = [p for p in self.proxies if p.health >= PROXY_HEALTH_THRESHOLD]
-            return random.choice(valid) if valid else None
+                healthy = [p for p in self.proxies if p.is_healthy()]
+            return random.choice(healthy) if healthy else None
+
+    def sample_health(self, limit=5):
+        return sorted(self.proxies, key=lambda p: -p.health)[:limit]
 
 proxy_manager = ProxyManager()
-checked, available = 0, []
+checked = 0
+available = []
 checker_running = False
-semaphore = asyncio.Semaphore(CONCURRENT_CHECKS)
-failures = 0
+semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 def generate_usernames(n):
-    base = ["live", "chat", "play", "kick", "zone", "team"]
+    base = ["live", "chat", "kick", "play", "stream", "cult", "digi", "zero", "core", "cube"]
     return [random.choice(base) + str(random.randint(100, 9999)) for _ in range(n)]
 
-async def check_username(username):
-    global failures
-    async with semaphore:
-        for attempt in range(MAX_ATTEMPTS):
-            proxy_obj = await proxy_manager.get()
-            if not proxy_obj:
-                return False
-            start = time.time()
-            success = False
-            try:
-                timeout = aiohttp.ClientTimeout(total=8)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(f"https://kick.com/{username}", proxy=proxy_obj.proxy_str) as r:
-                        if r.status == 404:
-                            success = True
-            except Exception:
-                pass
+async def check_username(username, channel):
+    global checked
+    for _ in range(MAX_ATTEMPTS):
+        proxy_obj = await proxy_manager.get()
+        if not proxy_obj:
+            await asyncio.sleep(2)
+            continue
+        start = time.time()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://kick.com/{username}", proxy=proxy_obj.proxy_str, timeout=10) as r:
+                    elapsed = time.time() - start
+                    found = (r.status == 404)
+                    proxy_obj.update(elapsed, found)
+                    if found:
+                        available.append(username)
+                        await channel.send(f"✅ Available: `{username}`")
+                        break
+        except:
+            proxy_obj.update(0.5, False)
+        await asyncio.sleep(0.1)
+    checked += 1
 
-            elapsed = time.time() - start
-            proxy_obj.update(elapsed, success)
-
-            if success:
-                failures = 0
-                return True
-
-            await asyncio.sleep(FAILURE_BACKOFF[min(attempt, len(FAILURE_BACKOFF)-1)])
-
-        failures += 1
-        if failures > 20:
-            print("[Backoff] Too many fails. Sleeping for 5 seconds.")
-            await asyncio.sleep(5)
-        return False
-
-async def run_checker(channel):
+async def run_checker(channel, proxy_log_channel):
     global checked, available, checker_running
-    checked = 0
-    available = []
-    failures = 0
+    checked, available = 0, []
     checker_running = True
+    await proxy_manager.load()
 
     usernames = generate_usernames(CHECK_LIMIT)
     tasks = []
@@ -156,60 +133,55 @@ async def run_checker(channel):
     for name in usernames:
         if not checker_running:
             break
-        task = asyncio.create_task(check_username(name))
-        tasks.append((name, task))
+        await semaphore.acquire()
+        task = asyncio.create_task(worker(name, channel))
+        task.add_done_callback(lambda t: semaphore.release())
+        tasks.append(task)
 
-    for name, task in tasks:
-        if not checker_running:
-            break
-        result = await task
-        if result:
-            available.append(name)
-            await channel.send(f"✅ `{name}`")
-        checked += 1
-
+    await asyncio.gather(*tasks)
     checker_running = False
-    await channel.send("*✅ Done checking Kick usernames*")
+    await channel.send("*✅ Username check complete!*")
+
+    # Log sample proxy health
+    sample = proxy_manager.sample_health()
+    log = "\n".join(
+        f"{p.proxy_str.split('@')[-1]} | Health: {p.health:.1f}% | RT: {p.avg_rt}s"
+        for p in sample
+    )
+    await proxy_log_channel.send(f"🧠 Proxy Stats:\n```\n{log}\n```")
+
+async def worker(username, channel):
+    try:
+        await check_username(username, channel)
+    except:
+        pass
 
 @bot.event
 async def on_ready():
-    print(f"[Discord] Logged in as {bot.user}")
-    await proxy_manager.load()
-    restock_loop.start()
-
-@tasks.loop(seconds=RESTOCK_INTERVAL)
-async def restock_loop():
-    print("[Auto Restock] Reloading proxy list.")
+    print(f"✅ Logged in as {bot.user}")
     await proxy_manager.load()
 
 @bot.command(name="kickstart")
 async def kickstart(ctx):
     global checker_running
     if checker_running:
-        await ctx.send("Checker already running.")
+        await ctx.send("Already running.")
         return
-    await ctx.send("*Checking Kick users...*")
-    channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx.channel
-    await run_checker(channel)
+    await ctx.send("🟢 Starting Kick checker...")
+    main_channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    proxy_log_channel = bot.get_channel(PROXIES_CHANNEL_ID)
+    await run_checker(main_channel or ctx.channel, proxy_log_channel or ctx.channel)
 
 @bot.command(name="kickstop")
 async def kickstop(ctx):
     global checker_running
     checker_running = False
-    await ctx.send("*Checker stopped.*")
+    await ctx.send("🛑 Checker stopped.")
 
 @bot.command(name="kickstatus")
 async def kickstatus(ctx):
-    sample = proxy_manager.proxies[:5]
-    stats = "\n".join(
-        f"{p.proxy_str.split('@')[-1]} | Health: {p.health:.1f}% | Hits: {p.hits} | Total: {p.total} | RT: {p.avg_response:.2f}s"
-        for p in sample
-    )
-    await ctx.send(
-        f"✅ Checked: {checked}/{CHECK_LIMIT}\n"
-        f"🎯 Hits: {len(available)}\n"
-        f"🧠 Proxies:\n{stats}"
-    )
+    text = f"✅ Checked: {checked}/{CHECK_LIMIT}\n🎯 Hits: {len(available)}"
+    await ctx.send(text)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
