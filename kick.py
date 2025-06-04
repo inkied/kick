@@ -4,7 +4,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -15,7 +15,6 @@ WEBSHARE_API_KEY = os.getenv("WEBSHARE_API_KEY")
 MAX_CONCURRENT_CHECKS = 20
 DISCORD_MESSAGE_DELAY = 2  # seconds between Discord messages
 
-# Enable privileged message content intent — MAKE SURE IT'S ENABLED IN THE DISCORD DEVELOPER PORTAL TOO!
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -31,6 +30,11 @@ available_count = 0
 checking = False
 check_task = None
 current_index = 0
+
+proxy_response_times = []
+proxy_response_lock = asyncio.Lock()
+
+check_start_time = None
 
 async def fetch_proxies():
     url = "https://proxy.webshare.io/api/proxy/list/"
@@ -62,9 +66,16 @@ async def get_next_proxy():
 async def check_username(session, username):
     global available_count
     proxy = await get_next_proxy()
+    start = datetime.utcnow()
     try:
         url = f"https://kick.com/api/v1/channels/{username}"
         async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            elapsed = (datetime.utcnow() - start).total_seconds()
+            # Track proxy response time
+            async with proxy_response_lock:
+                proxy_response_times.append(elapsed)
+                if len(proxy_response_times) > 50:
+                    proxy_response_times.pop(0)
             if resp.status == 404:
                 available_count += 1
                 await send_available(username)
@@ -97,7 +108,8 @@ async def send_progress():
         await channel.send(embed=embed)
 
 async def checker_loop():
-    global checked_count, checking, current_index
+    global checked_count, checking, current_index, check_start_time
+    check_start_time = datetime.utcnow()
     connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT_CHECKS)
     async with aiohttp.ClientSession(connector=connector) as session:
         while checking and current_index < len(wordlist):
@@ -133,6 +145,47 @@ async def stop(ctx):
         return
     checking = False
     await ctx.send("Checker stopped. You can resume with `/start`.")
+
+@bot.command()
+async def status(ctx):
+    if not wordlist:
+        await ctx.send("Wordlist not loaded yet.")
+        return
+    elapsed = (datetime.utcnow() - check_start_time).total_seconds() if check_start_time else 0
+    rate = checked_count / elapsed if elapsed > 0 else 0
+    remaining = len(wordlist) - checked_count
+    eta_seconds = remaining / rate if rate > 0 else -1
+
+    # Average proxy response time
+    async with proxy_response_lock:
+        if proxy_response_times:
+            avg_response = sum(proxy_response_times) / len(proxy_response_times)
+        else:
+            avg_response = 0
+
+    # Proxy health status based on avg response time
+    if avg_response == 0:
+        health = "No proxy data yet"
+    elif avg_response < 1:
+        health = "Fast"
+    elif avg_response < 3:
+        health = "Okay"
+    else:
+        health = "Slow"
+
+    eta_str = str(timedelta(seconds=int(eta_seconds))) if eta_seconds > 0 else "Unknown"
+
+    embed = discord.Embed(
+        title="Checker Status",
+        color=discord.Color.gold(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Checked", value=f"{checked_count} / {len(wordlist)}", inline=True)
+    embed.add_field(name="Available Found", value=str(available_count), inline=True)
+    embed.add_field(name="Proxy Health", value=health, inline=True)
+    embed.add_field(name="Avg Proxy Response", value=f"{avg_response:.2f} sec", inline=True)
+    embed.add_field(name="Estimated Time Left", value=eta_str, inline=True)
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_ready():
