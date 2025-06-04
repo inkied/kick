@@ -1,157 +1,136 @@
 import os
-import aiohttp
 import asyncio
+import aiohttp
 import discord
 from discord.ext import commands
+from dotenv import load_dotenv
 from datetime import datetime
 
-# --- CONFIGURATION ---
+load_dotenv()
+
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1373430943783718953"))
+DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
+WEBSHARE_API_KEY = os.getenv("WEBSHARE_API_KEY")
 
-PROXY_USER = os.getenv("PROXY_USER", "trdwseke-rotate")
-PROXY_PASS = os.getenv("PROXY_PASS", "n0vc7b0ev31y")
-PROXY_PORT = os.getenv("PROXY_PORT", "80")
-PROXY_FORMAT = f"http://{PROXY_USER}:{PROXY_PASS}@proxy.webshare.io:{PROXY_PORT}"
+PROXY_USER = os.getenv("PROXY_USER")
+PROXY_PASS = os.getenv("PROXY_PASS")
+PROXY_HOST = os.getenv("PROXY_HOST")
+PROXY_PORT = int(os.getenv("PROXY_PORT"))
 
-WORDLIST_FILES = [
-    "Brandable.txt",
-    "Culture.txt",
-    "Gaming.txt",
-    "Mythology.txt",
-    "Nature.txt",
-    "Philosophy.txt",
-    "Tech.txt"
-]
+WORDLIST_FILES = ["Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt", "Nature.txt", "Philosophy.txt", "Tech.txt"]
 
 MAX_CONCURRENT_CHECKS = 20
-PROGRESS_UPDATE_EVERY = 50
-DISCORD_MESSAGE_DELAY = 5
+DISCORD_MESSAGE_DELAY = 5  # seconds delay between Discord messages to avoid spam
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+proxies = []
+proxy_index = 0
+proxy_lock = asyncio.Lock()
 
 wordlist = []
-total_users = 0
 checked_count = 0
 available_count = 0
-stop_checker = False
-checking_task = None
-lock = asyncio.Lock()
+checking = False
+check_task = None
+current_index = 0
 
-def load_wordlist():
+async def load_wordlist():
     usernames = set()
-    for filename in WORDLIST_FILES:
-        if os.path.isfile(filename):
-            with open(filename, "r", encoding="utf-8") as f:
-                for line in f:
-                    name = line.strip().lower()
-                    if name and name.isalpha():
-                        usernames.add(name)
+    for file in WORDLIST_FILES:
+        if os.path.exists(file):
+            with open(file, "r", encoding="utf-8") as f:
+                usernames.update(line.strip().lower() for line in f if line.strip())
     return list(usernames)
 
 def get_proxy_url():
-    return PROXY_FORMAT
+    return f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
 async def check_username(session, username):
-    proxy = get_proxy_url()
-    url = f"https://kick.com/api/v1/channels/{username}"
+    global available_count
+    proxy_url = get_proxy_url()
     try:
-        async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(f"https://kick.com/api/v1/channels/{username}", proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 404:
-                return True
-            elif resp.status == 200:
-                return False
-            else:
-                return None
-    except:
-        return None
+                available_count += 1
+                await send_available(username)
+            # 200 means taken, do nothing
+    except Exception:
+        # silently ignore errors or you can log if you want
+        pass
 
-async def send_discord_message(channel, username, checked, total):
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+async def send_available(username):
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
     embed = discord.Embed(
         title=f"Check @{username}",
-        description=f"Checked **{checked}/{total}** usernames\nTimestamp: {now}",
-        color=0x1abc9c,
+        description=f"Username `{username}` is available on Kick.com!",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
     )
     embed.set_footer(text="By Kick")
     await channel.send(embed=embed)
     await asyncio.sleep(DISCORD_MESSAGE_DELAY)
 
-async def checker_loop(channel):
-    global checked_count, available_count, stop_checker
+async def send_progress():
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    embed = discord.Embed(
+        title="Checker Progress",
+        description=f"Checked {checked_count}/{len(wordlist)} usernames.",
+        color=discord.Color.blue(),
+        timestamp=datetime.utcnow()
+    )
+    embed.set_footer(text="By Kick")
+    await channel.send(embed=embed)
 
+async def checker_loop():
+    global checked_count, checking, current_index
     connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT_CHECKS)
     async with aiohttp.ClientSession(connector=connector) as session:
-        for username in wordlist:
-            async with lock:
-                if stop_checker:
-                    break
-                checked_count += 1
-            is_available = await check_username(session, username)
-            if is_available:
-                available_count += 1
-                await send_discord_message(channel, username, checked_count, total_users)
+        while checking and current_index < len(wordlist):
+            batch = wordlist[current_index:current_index + MAX_CONCURRENT_CHECKS]
+            tasks = [check_username(session, username) for username in batch]
+            await asyncio.gather(*tasks)
+            checked_count += len(batch)
+            current_index += len(batch)
+            if checked_count % 50 == 0 or current_index >= len(wordlist):
+                await send_progress()
+            await asyncio.sleep(1)  # small delay to keep proxies healthy
+    checking = False
 
-            if checked_count % PROGRESS_UPDATE_EVERY == 0 or checked_count == total_users:
-                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                await channel.send(
-                    f"Progress update: Checked **{checked_count}/{total_users}** usernames as of {now}"
-                )
+@bot.command()
+async def start(ctx):
+    global checking, check_task, checked_count, available_count, current_index
+    if checking:
+        await ctx.send("Checker is already running.")
+        return
+    # If finished previously, reset to start fresh or resume from current_index
+    if current_index >= len(wordlist):
+        checked_count = 0
+        available_count = 0
+        current_index = 0
+    checking = True
+    await ctx.send(f"Checker started! Total usernames: {len(wordlist)}")
+    check_task = asyncio.create_task(checker_loop())
 
-    if not stop_checker:
-        await channel.send("✅ Checking completed!")
+@bot.command()
+async def stop(ctx):
+    global checking
+    if not checking:
+        await ctx.send("Checker is not running.")
+        return
+    checking = False
+    await ctx.send("Checker stopped. You can resume with `/start`.")
 
 @bot.event
 async def on_ready():
-    global wordlist, total_users, checked_count, available_count
+    global wordlist
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    wordlist = load_wordlist()
-    total_users = len(wordlist)
-    checked_count = 0
-    available_count = 0
-    print(f"Loaded {total_users} usernames.")
+    wordlist = await load_wordlist()
+    print(f"Loaded {len(wordlist)} usernames from wordlists.")
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
-        await channel.send("Checker ready. Use `!start` to begin checking, `!stop` to pause.")
-
-@bot.command(name="start")
-async def start_checker(ctx):
-    global checking_task, stop_checker
-
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send("Please use commands in the designated channel.")
-        return
-
-    if checking_task and not checking_task.done():
-        await ctx.send("Checker is already running.")
-        return
-
-    stop_checker = False
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if not channel:
-        await ctx.send("Error: Channel not found.")
-        return
-
-    await ctx.send("Starting the checker...")
-    checking_task = bot.loop.create_task(checker_loop(channel))
-
-@bot.command(name="stop")
-async def stop_checker_cmd(ctx):
-    global stop_checker
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send("Please use commands in the designated channel.")
-        return
-
-    stop_checker = True
-    await ctx.send("Stopping the checker...")
+        await channel.send("Checker bot is online and ready! Use `/start` to begin.")
 
 if __name__ == "__main__":
-    if not DISCORD_BOT_TOKEN:
-        print("Error: DISCORD_BOT_TOKEN environment variable not set.")
-        exit(1)
-    if not DISCORD_CHANNEL_ID:
-        print("Error: DISCORD_CHANNEL_ID environment variable not set or invalid.")
-        exit(1)
     bot.run(DISCORD_BOT_TOKEN)
