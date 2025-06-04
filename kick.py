@@ -9,6 +9,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import os
+import asyncio
+import aiohttp
+import discord
+import time
+import random
+from discord.ext import commands
+from dotenv import load_dotenv
+
+# Load .env variables
+load_dotenv()
+
 # ========== ENV VARS ==========
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
@@ -18,16 +30,12 @@ PROXY_PASS = os.getenv("PROXY_PASS")
 PROXY_HOST = os.getenv("PROXY_HOST")
 PROXY_PORT = os.getenv("PROXY_PORT")
 
-import discord
-from discord.ext import commands
-
+# ========== BOT SETUP ==========
 COMMAND_PREFIX = '.'
-
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # Required to read user messages for commands
 
-bot = commands.Bot(command_prefix='.', intents=intents)
-
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 # ========== CONFIG ==========
 MAX_ATTEMPTS = 4
 CHECK_LIMIT = 100
