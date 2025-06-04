@@ -1,41 +1,30 @@
+import os
 import requests
 import random
 import threading
 import time
 import queue
-import os
-from glob import glob
 from telegram import Bot, Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# === CONFIG ===
-TELEGRAM_BOT_TOKEN = "8110247076:AAH7D6YN0nWBQsAASHi8"
-TELEGRAM_CHAT_ID = "7755395640"
-WEBSHARE_API_KEY = "pialip63c4jeia0g8e8memjyj77ctky7ooq9b37q"
+# Load env variables (set these on Railway)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WEBSHARE_API_KEY = os.getenv("WEBSHARE_API_KEY")
 
+WORDLIST_FILE = "wordlist.txt"
 AVAILABLE_FILE = "available.txt"
-PROGRESS_FILE = "progress.txt"
-NUM_THREADS = 30
-PROXY_REFRESH_INTERVAL = 600  # seconds (10 minutes)
-CHECK_PAUSE = 0.1  # seconds pause between checks for proxy longevity
-WORDLIST_FOLDER = "wordlists"
+NUM_THREADS = 20
+PROXY_REFRESH_INTERVAL = 600  # 10 minutes
+CHECK_PAUSE = 0.1
 
-# Allowed chars for Kick usernames (letters only)
-ALLOWED_CHARS = set("abcdefghijklmnopqrstuvwxyz")
-
-# Thread-safe queue for usernames
 username_queue = queue.Queue()
-
-# Proxy list and lock
 proxy_list = []
 proxy_lock = threading.Lock()
-
-# Control flags
 running = False
 running_lock = threading.Lock()
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
 
 def fetch_proxies():
     url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100"
@@ -48,15 +37,11 @@ def fetch_proxies():
             f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
             for p in data.get('results', [])
         ]
-        if proxies:
-            print(f"[INFO] Fetched {len(proxies)} proxies.")
-        else:
-            print("[WARN] Proxy fetch returned empty.")
+        print(f"[INFO] Fetched {len(proxies)} proxies")
         return proxies
     except Exception as e:
         print(f"[ERROR] Proxy fetch failed: {e}")
         return []
-
 
 def proxy_refresher():
     global proxy_list
@@ -65,63 +50,22 @@ def proxy_refresher():
         if new_proxies:
             with proxy_lock:
                 proxy_list = new_proxies
-        else:
-            print("[WARN] Keeping previous proxies due to empty fetch.")
         time.sleep(PROXY_REFRESH_INTERVAL)
-
 
 def send_telegram_message(text):
     try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception as e:
         print(f"[ERROR] Telegram send failed: {e}")
 
-
-def load_wordlists():
-    word_files = glob(os.path.join(WORDLIST_FOLDER, "*.txt"))
-    if not word_files:
-        print(f"[ERROR] No wordlist .txt files found in '{WORDLIST_FOLDER}' folder!")
+def load_wordlist():
+    if not os.path.exists(WORDLIST_FILE):
+        print(f"[ERROR] Wordlist file '{WORDLIST_FILE}' not found.")
         return []
-    all_words = []
-    for wf in word_files:
-        try:
-            with open(wf, "r", encoding="utf-8") as f:
-                for line in f:
-                    w = line.strip().lower()
-                    if 3 <= len(w) <= 15 and set(w) <= ALLOWED_CHARS:
-                        all_words.append(w)
-        except Exception as e:
-            print(f"[ERROR] Failed reading {wf}: {e}")
-    if not all_words:
-        print("[WARN] Wordlists loaded but no valid words found.")
-    else:
-        print(f"[INFO] Loaded {len(all_words)} usernames from wordlists.")
-    return all_words
-
-
-def save_progress(index):
-    try:
-        with open(PROGRESS_FILE, "w") as f:
-            f.write(str(index))
-    except Exception as e:
-        print(f"[ERROR] Saving progress failed: {e}")
-
-
-def load_progress():
-    try:
-        with open(PROGRESS_FILE, "r") as f:
-            return int(f.read().strip())
-    except:
-        return 0
-
-
-def username_generator(words, start_index=0):
-    i = start_index
-    length = len(words)
-    while True:
-        yield words[i % length]
-        i += 1
-
+    with open(WORDLIST_FILE, "r") as f:
+        words = [w.strip().lower() for w in f if 3 <= len(w.strip()) <= 15]
+    print(f"[INFO] Loaded {len(words)} usernames from wordlist")
+    return words
 
 def check_username(username):
     with proxy_lock:
@@ -129,7 +73,6 @@ def check_username(username):
             print("[WARN] No proxies available, skipping check.")
             return
         proxy = random.choice(proxy_list)
-
     proxies = {"http": proxy, "https": proxy}
     url = f"https://kick.com/api/v2/channels/{username}"
     try:
@@ -138,30 +81,35 @@ def check_username(username):
             print(f"[AVAILABLE] {username}")
             with open(AVAILABLE_FILE, "a") as f:
                 f.write(username + "\n")
-            send_telegram_message(f"Available: `{username}`")
-        elif response.status_code == 200:
-            print(f"[TAKEN] {username}")
+            send_telegram_message(f"Available: {username}")
         else:
-            print(f"[SKIP] {username} - Status {response.status_code}")
+            print(f"[TAKEN] {username}")
     except Exception as e:
-        print(f"[ERROR] {username} proxy or request failed: {e}")
-
+        print(f"[ERROR] {username} request failed: {e}")
 
 def worker():
     while True:
         username = username_queue.get()
         if username is None:
             break
-
         with running_lock:
             if not running:
                 username_queue.task_done()
                 break
-
         check_username(username)
         time.sleep(CHECK_PAUSE)
         username_queue.task_done()
 
+def enqueue_usernames(words):
+    checked = set()
+    # Load already checked usernames so we skip them
+    if os.path.exists(AVAILABLE_FILE):
+        with open(AVAILABLE_FILE, "r") as f:
+            for line in f:
+                checked.add(line.strip().lower())
+    for username in words:
+        if username not in checked:
+            username_queue.put(username)
 
 def start_checking(update: Update, context: CallbackContext):
     global running
@@ -170,40 +118,14 @@ def start_checking(update: Update, context: CallbackContext):
             update.message.reply_text("Already running!")
             return
         running = True
-
-    update.message.reply_text("Started username checking!")
-
-    # Load usernames once and shuffle once for consistent order
-    words = load_wordlists()
+    update.message.reply_text("Starting username checking...")
+    words = load_wordlist()
     if not words:
-        update.message.reply_text("No valid wordlists found. Cannot start.")
+        update.message.reply_text("No usernames found to check!")
         with running_lock:
             running = False
         return
-
-    random.shuffle(words)
-
-    def enqueue_usernames():
-        start_idx = load_progress()
-        gen = username_generator(words, start_idx)
-        count_since_save = 0
-        current_idx = start_idx
-
-        while True:
-            with running_lock:
-                if not running:
-                    save_progress(current_idx)  # Save progress on stop
-                    break
-            username = next(gen)
-            username_queue.put(username)
-            current_idx += 1
-            count_since_save += 1
-            if count_since_save >= 50:
-                save_progress(current_idx)
-                count_since_save = 0
-
-    threading.Thread(target=enqueue_usernames, daemon=True).start()
-
+    threading.Thread(target=enqueue_usernames, args=(words,), daemon=True).start()
 
 def stop_checking(update: Update, context: CallbackContext):
     global running
@@ -212,9 +134,7 @@ def stop_checking(update: Update, context: CallbackContext):
             update.message.reply_text("Not running!")
             return
         running = False
-
     update.message.reply_text("Stopping username checking...")
-
     # Clear queue
     while not username_queue.empty():
         try:
@@ -223,35 +143,27 @@ def stop_checking(update: Update, context: CallbackContext):
         except queue.Empty:
             break
 
-
 def main():
-    # Start proxy refresher thread
     threading.Thread(target=proxy_refresher, daemon=True).start()
-
-    # Start worker threads
     threads = []
     for _ in range(NUM_THREADS):
         t = threading.Thread(target=worker, daemon=True)
         t.start()
         threads.append(t)
 
-    # Setup Telegram bot handlers
     updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
     dispatcher = updater.dispatcher
-
     dispatcher.add_handler(CommandHandler("start", start_checking))
     dispatcher.add_handler(CommandHandler("stop", stop_checking))
 
-    print("[INFO] Bot started. Waiting for /start command...")
+    print("[INFO] Bot started. Use /start to begin.")
     updater.start_polling()
     updater.idle()
 
-    # On shutdown: stop workers
     for _ in range(NUM_THREADS):
         username_queue.put(None)
     for t in threads:
         t.join()
-
 
 if __name__ == "__main__":
     main()
