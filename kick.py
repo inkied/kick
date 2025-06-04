@@ -1,18 +1,23 @@
 import asyncio
 import aiohttp
 import os
+import random
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1373466041342099507/GMkMgWO6DXx6ULaDvCxq1kfM5MzluC4v1DbKSBEyz5fp39-qCB2VN142Uj8ptiQM_re7"
 WEBSHARE_API_KEY = "pialip63c4jeia0g8e8memjyj77ctky7ooq9b37q"
-WORDLIST_FILES = ["Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt", "Nature.txt", "Philosophy.txt", "Tech.txt"]
+WORDLIST_FILES = [
+    "Brandable.txt", "Culture.txt", "Gaming.txt", "Mythology.txt",
+    "Nature.txt", "Philosophy.txt", "Tech.txt"
+]
 MAX_CONCURRENT_CHECKS = 20
 
 proxies = []
 proxy_index = 0
 lock = asyncio.Lock()
+discord_lock = asyncio.Lock()
 
 async def fetch_proxies():
-    url = "https://proxy.webshare.io/api/v2/proxy/list/"
+    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=1"
     headers = {"Authorization": f"Token {WEBSHARE_API_KEY}"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
@@ -32,17 +37,12 @@ async def fetch_proxies():
 async def get_next_proxy():
     global proxy_index
     async with lock:
-        if not proxies:
-            return None
         proxy = proxies[proxy_index % len(proxies)]
         proxy_index += 1
         return proxy
 
 async def check_username(session, username):
     proxy = await get_next_proxy()
-    if proxy is None:
-        print("No proxies available, skipping check.")
-        return
     url = f"https://kick.com/api/v1/channels/{username}"
     try:
         async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -51,20 +51,18 @@ async def check_username(session, username):
                 await send_to_discord(username)
             elif resp.status == 200:
                 print(f"[TAKEN] {username}")
-            else:
-                print(f"[UNKNOWN {resp.status}] {username}")
     except Exception:
-        # Silently ignore proxy/network errors
-        pass
+        pass  # Ignore exceptions silently
 
 async def send_to_discord(username):
-    await asyncio.sleep(5)  # Delay to prevent spam
-    payload = {"content": f"`{username}` is available on Kick.com!"}
-    async with aiohttp.ClientSession() as session:
-        try:
-            await session.post(DISCORD_WEBHOOK, json=payload)
-        except Exception:
-            pass
+    async with discord_lock:
+        await asyncio.sleep(5)  # Delay to prevent spam
+        payload = {"content": f"`{username}` is available on Kick.com!"}
+        async with aiohttp.ClientSession() as session:
+            try:
+                await session.post(DISCORD_WEBHOOK, json=payload)
+            except Exception:
+                pass
 
 async def load_wordlist():
     usernames = set()
@@ -81,17 +79,16 @@ async def main():
     if not proxies:
         print("No proxies loaded, exiting.")
         return
+
     wordlist = await load_wordlist()
     if not wordlist:
-        print("No usernames loaded, exiting.")
+        print("No usernames found in wordlists, exiting.")
         return
 
     connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENT_CHECKS)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [check_username(session, username) for username in wordlist]
-        for i in range(0, len(tasks), MAX_CONCURRENT_CHECKS):
-            batch = tasks[i:i+MAX_CONCURRENT_CHECKS]
-            await asyncio.gather(*batch)
+        await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
