@@ -1,18 +1,10 @@
-# Use a lightweight Python image
-FROM python:3.11-slim
+FROM python:3.10
 
-# Set working directory
 WORKDIR /app
 
-# Copy and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
 
-# Copy the rest of the app
-COPY . .
+RUN pip install --upgrade pip \
+ && pip install -r requirements.txt
 
-# Set environment variable for real-time output
-ENV PYTHONUNBUFFERED=1
-
-# Run your script
 CMD ["python", "kick.py"]
