@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import os
+import random
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1373466041342099507/GMkMgWO6DXx6ULaDvCxq1kfM5MzluC4v1DbKSBEyz5fp39-qCB2VN142Uj8ptiQM_re7"
 WEBSHARE_API_KEY = "pialip63c4jeia0g8e8memjyj77ctky7ooq9b37q"
@@ -54,12 +55,14 @@ async def send_to_discord(username):
             pass
 
 async def load_wordlist():
-    usernames = set()
-    for file in WORDLIST_FILES:
-        if os.path.exists(file):
-            with open(file, "r") as f:
-                usernames.update(line.strip().lower() for line in f if line.strip())
-    return list(usernames)
+    available_lists = [file for file in WORDLIST_FILES if os.path.exists(file)]
+    if not available_lists:
+        return []
+
+    selected_file = random.choice(available_lists)
+    print(f"🔄 Rotating wordlist: using `{selected_file}`")
+    with open(selected_file, "r") as f:
+        return [line.strip().lower() for line in f if line.strip()]
 
 async def main():
     global proxies
