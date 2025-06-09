@@ -1,10 +1,11 @@
+# ======= PART 1: Imports, env vars, Proxy and ProxyManager classes =======
+
 import os
 import asyncio
 import aiohttp
 import discord
 import time
 import random
-import string
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -17,41 +18,21 @@ PROXY_USER = os.getenv("PROXY_USER")
 PROXY_PASS = os.getenv("PROXY_PASS")
 
 COMMAND_PREFIX = '.'
+CHECK_LIMIT = 100
 PROXY_MIN = 10
 PROXY_MAX = 50
 GOOD_PROXIES_FILE = "proxies.txt"
-USERS_FILE = "users.txt"
-HITS_FILE = "hits.txt"
 PROXY_HEALTH_THRESHOLD = 50  # %
 PROXY_RESPONSE_THRESHOLD = 5  # seconds
 PROXY_BACKOFF = 10  # seconds cooldown between proxy uses
-CHECK_DELAY = 0.2  # Delay between checks to avoid rate limits
+USERS_FILE = "users.txt"
+THEMES_FILE = "themes.txt"
+HITS_FILE = "hits.txt"
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
-# === Pronounceable 4-letter username generator ===
-# Avoid weird combos, consonant-vowel-consonant-vowel or similar patterns
-vowels = "aeiou"
-consonants = "".join(set(string.ascii_lowercase) - set(vowels))
-
-def generate_pronounceable_4():
-    pattern = random.choice([
-        "cvcv",
-        "cvvc",
-        "vccv",
-        "ccvv",
-    ])
-    name = ""
-    for ch in pattern:
-        if ch == "c":
-            name += random.choice(consonants)
-        else:
-            name += random.choice(vowels)
-    return name
-
-# === Proxy class ===
 class Proxy:
     def __init__(self, proxy_str):
         self.proxy_str = proxy_str
@@ -79,7 +60,6 @@ class Proxy:
         if self.total >= 10:
             self.is_good = (self.health >= PROXY_HEALTH_THRESHOLD and self.avg_response <= PROXY_RESPONSE_THRESHOLD)
 
-# === Proxy Manager ===
 class ProxyManager:
     def __init__(self):
         self.proxies = []
@@ -103,21 +83,16 @@ class ProxyManager:
     async def fetch_new_proxies(self):
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
-            try:
-                async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
-                    data = await r.json()
-            except Exception as e:
-                print("[ProxyManager] Error fetching proxies:", e)
-                return []
-
-            proxies_list = []
-            for proxy_data in data.get("results", []):
-                ip = proxy_data.get("proxy_address")
-                port = proxy_data.get("port") or proxy_data.get("proxy_port")
-                if ip and port:
-                    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}"
-                    proxies_list.append(proxy_url)
-            return proxies_list
+            async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
+                data = await r.json()
+                proxies_list = []
+                for proxy_data in data.get("results", []):
+                    ip = proxy_data.get("proxy_address")
+                    port = proxy_data.get("port") or proxy_data.get("proxy_port")
+                    if ip and port:
+                        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}"
+                        proxies_list.append(proxy_url)
+                return proxies_list
 
     async def refill_proxies(self):
         async with self.lock:
@@ -138,7 +113,6 @@ class ProxyManager:
                         added += 1
                 print(f"[ProxyManager] Added {added} new proxies")
 
-            # Sort proxies by hits desc and avg response asc
             self.proxies.sort(key=lambda x: (-x.hits, x.avg_response))
             self.proxies = self.proxies[:PROXY_MAX]
 
@@ -161,10 +135,12 @@ class ProxyManager:
 proxy_manager = ProxyManager()
 proxy_manager.load_good_proxies()
 
+# ======= PART 2: Checker logic, loading usernames, checking, and saving hits =======
+
 checked = 0
 available_users = []
 checker_running = False
-checker_task = None
+checker_paused = False
 
 async def check_username(username):
     proxy_obj = await proxy_manager.get_proxy()
@@ -185,106 +161,156 @@ async def check_username(username):
     proxy_obj.update(response_time, success)
     return success
 
+def load_user_list(filename):
+    if not os.path.exists(filename):
+        return []
+    with open(filename, "r") as f:
+        return [line.strip() for line in f if line.strip()]
+
+def save_hit(username):
+    with open(HITS_FILE, "a") as f:
+        f.write(username + "\n")
+
+async def generate_pronounceable_4():
+    # Simplified basic pronounceable 4-char generator: consonant-vowel-consonant-vowel
+    consonants = "bcdfghjklmnpqrstvwxyz"
+    vowels = "aeiou"
+    return ''.join([
+        random.choice(consonants),
+        random.choice(vowels),
+        random.choice(consonants),
+        random.choice(vowels),
+    ])
+
 async def checker_loop():
-    global checked, available_users, checker_running
+    global checked, available_users, checker_running, checker_paused
+
     while checker_running:
-        if not os.path.exists(USERS_FILE):
-            await asyncio.sleep(5)
+        if checker_paused:
+            await asyncio.sleep(2)
             continue
-        with open(USERS_FILE, "r") as f:
-            users = [u.strip() for u in f if u.strip()]
+
+        # Load users.txt first
+        users = load_user_list(USERS_FILE)
         if not users:
-            # Generate pronounceable 4-letter usernames if file empty
-            generated = [generate_pronounceable_4() for _ in range(100)]
-            with open(USERS_FILE, "w") as fw:
-                fw.write("\n".join(generated))
-            users = generated
+            # fallback: generate usernames from themes.txt by combining themes with random suffix
+            themes = load_user_list(THEMES_FILE)
+            if not themes:
+                # generate pronounceable 4-letter usernames as fallback
+                users = [await generate_pronounceable_4() for _ in range(CHECK_LIMIT)]
+            else:
+                # generate themed usernames (theme + 2 random letters)
+                users = []
+                for theme in themes:
+                    for _ in range(3):  # try 3 variants per theme
+                        suffix = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=2))
+                        users.append(theme + suffix)
+                        if len(users) >= CHECK_LIMIT:
+                            break
+                    if len(users) >= CHECK_LIMIT:
+                        break
 
         for username in users:
-            if not checker_running:
+            if not checker_running or checker_paused:
                 break
+
             checked += 1
-            available = await check_username(username)
-            if available:
+            success = await check_username(username)
+            if success:
                 available_users.append(username)
-                with open(HITS_FILE, "a") as f:
-                    f.write(username + "\n")
-            await asyncio.sleep(CHECK_DELAY)
+                save_hit(username)
+                channel = bot.get_channel(DISCORD_CHANNEL_ID)
+                if channel:
+                    try:
+                        await channel.send(f"✅ Available: `{username}`")
+                    except Exception as e:
+                        print(f"[Discord] Send message failed: {e}")
 
-        # After batch check, refill proxies and save best
+        # After checking this batch, save and refill proxies if needed
         await proxy_manager.refill_proxies()
+        await asyncio.sleep(1)  # small delay before next batch
 
-async def send_status(channel):
-    while True:
-        total_proxies = len(proxy_manager.proxies)
-        healthy_proxies = len([p for p in proxy_manager.proxies if p.is_good])
-        unhealthy_proxies = total_proxies - healthy_proxies
-        top_proxies = sorted(proxy_manager.proxies, key=lambda p: (-p.hits, p.avg_response))[:10]
-
-        status_msg = (
-            f"**Checker Status:**\n"
-            f"Checked usernames: {checked}\n"
-            f"Available users found: {len(available_users)}\n"
-            f"Total proxies: {total_proxies}\n"
-            f"Healthy proxies: {healthy_proxies}\n"
-            f"Unhealthy proxies: {unhealthy_proxies}\n"
-            f"**Top 10 Proxies:**\n"
-        )
-        for p in top_proxies:
-            status_msg += f"{p.proxy_str} — Hits: {p.hits} — Avg Response: {p.avg_response:.2f}s — Health: {p.health}%\n"
-
-        await channel.send(status_msg)
-        await asyncio.sleep(60)
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    bot.status_task = asyncio.create_task(send_status(channel))
+# ======= PART 3: Discord bot commands, stats, start/pause/resume =======
 
 @bot.command()
 async def start(ctx):
-    global checker_running, checker_task, checked, available_users
+    global checker_running, checker_task, checker_paused
     if checker_running:
-        await ctx.send("Checker is already running.")
+        await ctx.send("Checker already running.")
         return
     checker_running = True
-    checked = 0
-    available_users = []
+    checker_paused = False
     checker_task = asyncio.create_task(checker_loop())
     await ctx.send("Checker started.")
 
 @bot.command()
+async def pause(ctx):
+    global checker_paused
+    if not checker_running:
+        await ctx.send("Checker is not running.")
+        return
+    if checker_paused:
+        await ctx.send("Checker is already paused.")
+        return
+    checker_paused = True
+    await ctx.send("Checker paused.")
+
+@bot.command()
+async def resume(ctx):
+    global checker_paused
+    if not checker_running:
+        await ctx.send("Checker is not running.")
+        return
+    if not checker_paused:
+        await ctx.send("Checker is not paused.")
+        return
+    checker_paused = False
+    await ctx.send("Checker resumed.")
+
+@bot.command()
 async def stop(ctx):
-    global checker_running, checker_task
+    global checker_running, checker_task, checker_paused
     if not checker_running:
         await ctx.send("Checker is not running.")
         return
     checker_running = False
+    checker_paused = False
     if checker_task:
         checker_task.cancel()
-        checker_task = None
     await ctx.send("Checker stopped.")
 
 @bot.command()
-async def status(ctx):
+async def stats(ctx):
     total_proxies = len(proxy_manager.proxies)
     healthy_proxies = len([p for p in proxy_manager.proxies if p.is_good])
     unhealthy_proxies = total_proxies - healthy_proxies
-    top_proxies = sorted(proxy_manager.proxies, key=lambda p: (-p.hits, p.avg_response))[:10]
+    hit_rate = len(available_users)
 
-    status_msg = (
+    top_proxies = sorted(proxy_manager.proxies, key=lambda p: (-p.hits, p.avg_response))[:10]
+    leaderboard = ""
+    for i, p in enumerate(top_proxies, 1):
+        leaderboard += f"{i}. Hits: {p.hits}, AvgResp: {p.avg_response:.2f}s, Health: {p.health}%\n"
+
+    msg = (
         f"**Checker Status:**\n"
         f"Checked usernames: {checked}\n"
-        f"Available users found: {len(available_users)}\n"
+        f"Available users found: {hit_rate}\n"
         f"Total proxies: {total_proxies}\n"
         f"Healthy proxies: {healthy_proxies}\n"
         f"Unhealthy proxies: {unhealthy_proxies}\n"
-        f"**Top 10 Proxies:**\n"
+        f"**Top 10 Proxies:**\n{leaderboard}"
     )
-    for p in top_proxies:
-        status_msg += f"{p.proxy_str} — Hits: {p.hits} — Avg Response: {p.avg_response:.2f}s — Health: {p.health}%\n"
+    await ctx.send(msg)
 
-    await ctx.send(status_msg)
+@bot.event
+async def on_ready():
+    print(f"[Discord] Logged in as {bot.user} (ID: {bot.user.id})")
+    await proxy_manager.refill_proxies()
 
-bot.run(DISCORD_TOKEN)
+# ======= PART 4: Main bot runner =======
+
+if __name__ == "__main__":
+    try:
+        bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        print("Bot stopped manually")
