@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from datetime import datetime
 from itertools import product
 
+bot = commands.Bot(command_prefix='.')
+
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
