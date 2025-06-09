@@ -212,17 +212,17 @@ class KickUsernameChecker:
             cooldown = stats.is_on_cooldown() if stats else False
 
             status_msg = (
-                f"Current Username: `{self.current_username or 'N/A'}`\n"
-                f"Checked: {self.checked_count}/{total_usernames}\n"
-                f"Available Found: {self.available_count}\n"
-                f"Failed Proxies: {self.failed_proxy_count}\n"
-                f"Other Failures: {self.failed_other_count}\n"
-                f"Using Proxy: {proxy}\n"
-                f"Proxy Health: {proxy_health:.2f}\n"
-                f"Avg Proxy Resp Time: {avg_resp:.2f}s\n"
-                f"Proxy Cooldown: {'Yes' if cooldown else 'No'}"
-            )   f"Estimated Time Remaining: {eta_seconds // 60}m {eta_seconds % 60}s"
-
+    f"Current Username: `{self.current_username or 'N/A'}`\n"
+    f"Checked: {self.checked_count}/{total_usernames}\n"
+    f"Available Found: {self.available_count}\n"
+    f"Failed Proxies: {self.failed_proxy_count}\n"
+    f"Other Failures: {self.failed_other_count}\n"
+    f"Using Proxy: {proxy}\n"
+    f"Proxy Health: {proxy_health:.2f}\n"
+    f"Avg Proxy Resp Time: {avg_resp:.2f}s\n"
+    f"Proxy Cooldown: {'Yes' if cooldown else 'No'}\n"
+    f"Estimated Time Remaining: {eta_seconds // 60}m {eta_seconds % 60}s"
+)
             now = time.time()
             if now - self.last_stats_sent > 30:  # only update every 30 seconds
                 await self.update_status(status_msg)
