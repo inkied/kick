@@ -23,14 +23,13 @@ CHECK_LIMIT = 100
 PROXY_MIN = 10
 PROXY_MAX = 50
 GOOD_PROXIES_FILE = "proxies.txt"
-PROXY_HEALTH_THRESHOLD = 50  # Use proxies with health > 50%
-PROXY_BACKOFF = 10  # seconds to cool down a proxy with low health
+PROXY_HEALTH_THRESHOLD = 50
+PROXY_BACKOFF = 10
 USERS_FILE = "users.txt"
 HITS_FILE = "hits.txt"
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 class Proxy:
@@ -61,11 +60,9 @@ class Proxy:
         if self.total >= PROXY_MIN and self.health < PROXY_HEALTH_THRESHOLD:
             self.is_good = False
 
-        print(
-            f"[Proxy Health] {self.proxy_str.split('@')[-1]} | "
-            f"Health: {self.health:.1f}% | Hits: {self.hits} | Total: {self.total} | "
-            f"Avg RT: {self.avg_response:.2f}s | Good: {self.is_good}"
-        )
+        print(f"[Proxy Health] {self.proxy_str.split('@')[-1]} | "
+              f"Health: {self.health:.1f}% | Hits: {self.hits} | Total: {self.total} | "
+              f"Avg RT: {self.avg_response:.2f}s | Good: {self.is_good}")
 
 class ProxyManager:
     def __init__(self):
@@ -136,7 +133,6 @@ def generate_usernames(n):
     for _ in range(n):
         name = random.choice(base) + str(random.randint(1, 9999))
         new_users.append(name)
-    # Append to users.txt
     with open(USERS_FILE, "a") as f:
         for user in new_users:
             f.write(user + "\n")
@@ -164,85 +160,71 @@ async def run_checker(channel):
     global checked, available, checker_running
     checked, available = 0, []
     checker_running = True
-
-    while checker_running:
-        # Load current usernames from users.txt
-        if not os.path.exists(USERS_FILE):
-            print(f"[Checker] {USERS_FILE} not found, generating initial usernames...")
-            usernames = generate_usernames(CHECK_LIMIT)
-        else:
-            with open(USERS_FILE, "r") as f:
-                usernames = [line.strip() for line in f if line.strip()]
-            if len(usernames) < CHECK_LIMIT:
-                to_generate = CHECK_LIMIT - len(usernames)
-                print(f"[Checker] Not enough usernames ({len(usernames)}), generating {to_generate} new ones.")
-                new_users = generate_usernames(to_generate)
-                usernames.extend(new_users)
-
-        print(f"[Checker] Starting batch of {CHECK_LIMIT} usernames at {datetime.now().strftime('%H:%M:%S')}")
-        await channel.send(f"🚀 Starting new batch of {CHECK_LIMIT} usernames at {datetime.now().strftime('%H:%M:%S')}")
-
-        batch_users = usernames[:CHECK_LIMIT]
-        # Remove batch from users.txt
-        with open(USERS_FILE, "w") as f:
-            for user in usernames[CHECK_LIMIT:]:
-                f.write(user + "\n")
-
-        checked, available = 0, []
-
-        start_time = time.time()
-        for name in batch_users:
-            if not checker_running:
-                break
-            if await check_username(name):
-                available.append(name)
-                with open(HITS_FILE, "a") as f:
-                    f.write(name + "\n")
-                await channel.send(f"✅ Available: `{name}`")
-            checked += 1
-            elapsed = time.time() - start_time
-            est_remain = (elapsed / checked) * (len(batch_users) - checked) if checked else 0
-            # Status message every 10 checks to avoid spam
-            if checked % 10 == 0:
-                await channel.send(f"⌛ Checked {checked}/{len(batch_users)} — Est. time left: {int(est_remain)}s", delete_after=5)
-            await asyncio.sleep(0.3)
-
-        duration = time.time() - start_time
-        success_rate = (len(available) / len(batch_users)) * 100 if batch_users else 0
-        await channel.send(
-            f"✅ Batch complete in {int(duration)} seconds.\n"
-            f"🎯 Total Checked: {checked}\n"
-            f"🎯 Total Hits: {len(available)}\n"
-            f"🎯 Success Rate: {success_rate:.2f}%"
-        )
-
-        proxy_manager.save_good_proxies()
-
-        # Wait a bit before next batch
-        await asyncio.sleep(3)
-
-@bot.event
-async def on_ready():
-    print(f"[Discord] Bot connected as {bot.user}")
     await proxy_manager.load()
 
-@bot.command(name="kickstart")
+    while checker_running:
+        if not os.path.exists(USERS_FILE) or os.path.getsize(USERS_FILE) == 0:
+            generate_usernames(CHECK_LIMIT)
+
+        with open(USERS_FILE, "r") as f:
+            usernames = [line.strip() for line in f if line.strip()]
+        print(f"[Checker] Loaded {len(usernames)} usernames")
+
+        for username in usernames:
+            if not checker_running:
+                break
+            checked += 1
+            success = await check_username(username)
+            if success:
+                available.append(username)
+                with open(HITS_FILE, "a") as f:
+                    f.write(username + "\n")
+                await channel.send(f"[HIT] https://kick.com/{username}")
+            await asyncio.sleep(random.uniform(0.4, 1.2))
+
+        with open(USERS_FILE, "w") as f:
+            f.truncate()
+        generate_usernames(CHECK_LIMIT)
+        print("[Checker] Batch complete. Rotating usernames.")
+
+# === YOUR ORIGINAL DISCORD COMMANDS ===
+
+@bot.command()
 async def kickstart(ctx):
     global checker_running
     if checker_running:
-        await ctx.send("Checker is already running.")
+        await ctx.send("⚠️ Checker already running.")
         return
-    await ctx.send("*Checking Kick Users*")
-    channel = bot.get_channel(DISCORD_CHANNEL_ID) or ctx
-    asyncio.create_task(run_checker(channel))
+    await ctx.send("✅ Checker started and resuming from last stop...")
+    await run_checker(ctx.channel)
 
-@bot.command(name="kickstop")
+@bot.command()
 async def kickstop(ctx):
     global checker_running
-    if not checker_running:
-        await ctx.send("Checker is not running.")
-        return
     checker_running = False
-    await ctx.send("Checker stopped.")
+    await ctx.send("🛑 Checker paused.")
+
+@bot.command()
+async def kickstatus(ctx):
+    if not checker_running:
+        await ctx.send("⚠️ Checker is not running.")
+        return
+    proxy_count = len(proxy_manager.proxies)
+    healthy = len([p for p in proxy_manager.proxies if p.is_good])
+    avg_speed = sum(p.avg_response for p in proxy_manager.proxies if p.total) / healthy if healthy else 0
+    hit_rate = round((len(available) / checked) * 100, 2) if checked else 0
+    eta = (len(available) / checked) * (CHECK_LIMIT - checked) if checked else 0
+
+    embed = discord.Embed(title="📊 Kick Checker Status", color=0x00ff00)
+    embed.add_field(name="🧠 Proxy Health", value=f"{(healthy / proxy_count) * 100:.2f}%", inline=True)
+    embed.add_field(name="⚡ Speed (avg)", value=f"{avg_speed:.2f}s", inline=True)
+    embed.add_field(name="🔥 Hit Success", value=f"{hit_rate}%", inline=True)
+    embed.add_field(name="🕒 Time", value=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'), inline=False)
+    embed.add_field(name="📌 Estimated Remaining", value=f"{int(eta)} usernames", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.event
+async def on_ready():
+    print(f"[Discord] Logged in as {bot.user.name}")
 
 bot.run(DISCORD_TOKEN)
