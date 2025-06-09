@@ -271,20 +271,24 @@ class DiscordBot:
             self.channel = self.bot.get_channel(self.channel_id)
             print(f"[DiscordBot] Logged in as {self.bot.user}")
 
+        @bot.command()
+async def start(ctx):
+    await ctx.send("Checking Started")
+       
         @self.bot.command()
         async def pause(ctx):
             checker.pause()
-            await ctx.send("Paused checking.")
+            await ctx.send("⏸️")
 
         @self.bot.command()
         async def resume(ctx):
             checker.resume()
-            await ctx.send("Resumed checking.")
+            await ctx.send("▶️")
 
         @self.bot.command()
         async def stop(ctx):
             checker.stop()
-            await ctx.send("Stopped checking.")
+            await ctx.send("🛑")
 
     async def send_alert(self, username):
         if not self.channel:
