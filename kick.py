@@ -128,9 +128,10 @@ class KickUsernameChecker:
 
     # ... other methods unchanged ...
 
-   async def run(self):
-    self.is_running = True
-    total_usernames = len(self.usernames)
+   class KickUsernameChecker:
+    async def run(self):
+        self.is_running = True
+        total_usernames = len(self.usernames)
 
     # Start progress ETA logger task
     progress_task = asyncio.create_task(self.log_progress_eta(interval_seconds=300))
