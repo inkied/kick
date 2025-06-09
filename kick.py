@@ -5,10 +5,13 @@ from discord.ext import commands
 import logging
 import random
 import os
+from datetime import datetime
 
 # -------- CONFIG FROM ENVIRONMENT VARIABLES --------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+KICK_CATEGORY_ID = int(os.getenv("KICK_CATEGORY_ID", "0"))
 KICK_LOGS_CHANNEL_ID = int(os.getenv("KICK_LOGS_CHANNEL_ID", "1381571071542558761"))
+PROXY_DASHBOARD_CHANNEL_ID = int(os.getenv("PROXY_DASHBOARD_CHANNEL_ID", "0"))
 PROXY_USER = os.getenv("PROXY_USER")
 PROXY_PASS = os.getenv("PROXY_PASS")
 WEBSHARE_KEY = os.getenv("WEBSHARE_KEY")
@@ -19,8 +22,9 @@ DEBUG_LOG = os.getenv("DEBUG_LOG", "True").lower() == "true"
 
 # -------- SETUP LOGGING --------
 logging.basicConfig(level=logging.DEBUG if DEBUG_LOG else logging.INFO)
+logger = logging.getLogger("kick_checker")
 
-# -------- GLOBALS --------
+# -------- DISCORD SETUP --------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=".", intents=intents)
@@ -43,7 +47,7 @@ class ProxyManager:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers=headers) as r:
                     if r.status != 200:
-                        logging.error(f"Proxy fetch failed with status: {r.status}")
+                        logger.error(f"Proxy fetch failed with status: {r.status}")
                         return []
 
                     data = await r.json()
@@ -56,11 +60,11 @@ class ProxyManager:
                             proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}"
                             proxies_list.append(proxy_url)
 
-                    logging.debug(f"Fetched {len(proxies_list)} proxies.")
+                    logger.debug(f"Fetched {len(proxies_list)} proxies.")
                     return proxies_list
 
         except Exception as e:
-            logging.error(f"Exception while fetching proxies: {e}")
+            logger.error(f"Exception while fetching proxies: {e}")
             return []
 
     async def load_proxies_from_file(self):
@@ -69,9 +73,9 @@ class ProxyManager:
                 with open(PROXY_FILE, "r") as f:
                     lines = [line.strip() for line in f if line.strip()]
                 self.proxies = lines
-                logging.info(f"Loaded {len(lines)} proxies from {PROXY_FILE}")
+                logger.info(f"Loaded {len(lines)} proxies from {PROXY_FILE}")
         except FileNotFoundError:
-            logging.warning(f"{PROXY_FILE} not found. No proxies loaded.")
+            logger.warning(f"{PROXY_FILE} not found. No proxies loaded.")
 
     async def validate_proxy(self, proxy):
         test_url = "https://kick.com"
@@ -92,7 +96,7 @@ class ProxyManager:
                 if ok:
                     valid.append(p)
             self.valid_proxies = valid
-            logging.info(f"Validated proxies: {len(valid)} good out of {len(self.proxies)}")
+            logger.info(f"Validated proxies: {len(valid)} good out of {len(self.proxies)}")
 
     async def refresh_proxies(self):
         new_proxies = await self.fetch_new_proxies()
@@ -121,6 +125,15 @@ async def save_hit(username: str):
         with open(HITS_FILE, "a") as f:
             f.write(username + "\n")
 
+async def send_kick_log(message: str):
+    channel = bot.get_channel(KICK_LOGS_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send(message)
+        except Exception as e:
+            logger.error(f"Failed to send log message: {e}")
+
+
 class KickUsernameChecker:
     def __init__(self, proxy_manager):
         self.proxy_manager = proxy_manager
@@ -134,9 +147,9 @@ class KickUsernameChecker:
         try:
             with open(USERNAME_FILE, "r") as f:
                 self.usernames = [line.strip() for line in f if line.strip()]
-            logging.info(f"Loaded {len(self.usernames)} usernames from {USERNAME_FILE}")
+            logger.info(f"Loaded {len(self.usernames)} usernames from {USERNAME_FILE}")
         except FileNotFoundError:
-            logging.error(f"{USERNAME_FILE} not found. No usernames loaded.")
+            logger.error(f"{USERNAME_FILE} not found. No usernames loaded.")
 
     async def check_username(self, username, proxy):
         url = f"https://kick.com/api/username/check?username={username}"  # Adjust to real API if needed
@@ -149,21 +162,21 @@ class KickUsernameChecker:
                         data = await resp.json()
                         available = data.get("available", False)
                         if DEBUG_LOG:
-                            logging.debug(f"Checked {username} with proxy {proxy}: {available}")
+                            logger.debug(f"Checked {username} with proxy {proxy}: {available}")
                         return available
                     else:
                         if DEBUG_LOG:
-                            logging.debug(f"Failed to check {username}: HTTP {resp.status}")
+                            logger.debug(f"Failed to check {username}: HTTP {resp.status}")
                         return False
         except Exception as e:
             if DEBUG_LOG:
-                logging.debug(f"Exception checking {username} with proxy {proxy}: {e}")
+                logger.debug(f"Exception checking {username} with proxy {proxy}: {e}")
             return False
 
     async def start(self):
         self.running = True
         self.paused = False
-        logging.info("KickUsernameChecker started.")
+        logger.info("KickUsernameChecker started.")
         while self.running and self.username_index < len(self.usernames):
             if self.paused:
                 await asyncio.sleep(1)
@@ -173,7 +186,7 @@ class KickUsernameChecker:
             proxy = self.proxy_manager.get_proxy()
 
             if proxy is None:
-                logging.warning("No valid proxies available, waiting for refresh...")
+                logger.warning("No valid proxies available, waiting for refresh...")
                 await asyncio.sleep(5)
                 continue
 
@@ -182,76 +195,129 @@ class KickUsernameChecker:
                 await save_hit(username)
                 await send_kick_log(f"Username available: `{username}`")
             self.username_index += 1
-            await asyncio.sleep(random.uniform(0.4, 1.2))  # Rate limit between checks
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
-        logging.info("KickUsernameChecker stopped or finished all usernames.")
+        logger.info("KickUsernameChecker finished or stopped.")
 
     async def stop(self):
         self.running = False
-        logging.info("KickUsernameChecker stopping.")
+        logger.info("KickUsernameChecker stopped.")
 
-async def send_kick_log(message: str):
-    channel = bot.get_channel(KICK_LOGS_CHANNEL_ID)
-    if channel:
-        try:
-            await channel.send(message)
-        except Exception as e:
-            logging.error(f"Failed to send log message: {e}")
-    else:
-        logging.warning("Kick logs channel not found.")
+    def pause(self):
+        self.paused = True
+        logger.info("KickUsernameChecker paused.")
 
-async def run_checker_loop():
-    global checker_task, checker
-    while True:
-        try:
-            await proxy_manager.refresh_proxies()
-            await send_kick_log("Proxies refreshed and validated.")
+    def resume(self):
+        self.paused = False
+        logger.info("KickUsernameChecker resumed.")
 
-            if checker is None:
-                checker = KickUsernameChecker(proxy_manager)
+    async def start(self):
+        self.running = True
+        self.paused = False
+        logger.info("KickUsernameChecker started.")
+        while self.running and self.username_index < len(self.usernames):
+            if self.paused:
+                await asyncio.sleep(1)
+                continue
 
-            await checker.start()
-            await send_kick_log("Checker stopped. Restarting in 5 seconds...")
-            checker = None
-            await asyncio.sleep(5)
+            username = self.usernames[self.username_index]
+            proxy = self.proxy_manager.get_proxy()
 
-        except asyncio.CancelledError:
-            await send_kick_log("Checker task cancelled.")
-            break
-        except Exception as e:
-            await send_kick_log(f"Checker crashed: {e}. Restarting in 5 seconds...")
-            checker = None
-            await asyncio.sleep(5)
+            if proxy is None:
+                logger.warning("No valid proxies available, waiting for refresh...")
+                await asyncio.sleep(5)
+                continue
 
-@bot.command()
-async def kickstart(ctx):
-    global checker_task
-    if checker_task and not checker_task.done():
-        await ctx.send("Checker already running!")
+            available = await self.check_username(username, proxy)
+            if available:
+                await save_hit(username)
+                await send_kick_log(f"Username available: `{username}`")
+
+            self.username_index += 1
+            await asyncio.sleep(random.uniform(0.4, 1.2))  # Adjust delay to be respectful
+
+        logger.info("KickUsernameChecker finished or stopped.")
+
+    def stop(self):
+        self.running = False
+
+async def send_category_start_messages():
+    if KICK_CATEGORY_ID == 0:
+        logger.warning("KICK_CATEGORY_ID is not set, skipping category channel messages.")
         return
-    await ctx.send("Starting Kick checker...")
-    checker_task = bot.loop.create_task(run_checker_loop())
 
-@bot.command()
-async def kickstop(ctx):
-    global checker_task, checker
-    if checker_task:
-        if checker:
-            await checker.stop()
-        checker_task.cancel()
-        checker_task = None
-        checker = None
-        await ctx.send("Checker stopped.")
-        await send_kick_log("Checker stopped by command.")
-    else:
-        await ctx.send("Checker is not running.")
+    category = discord.utils.get(bot.guilds[0].categories, id=KICK_CATEGORY_ID)
+    if not category:
+        logger.warning("Kick category not found.")
+        return
+
+    for channel in category.channels:
+        try:
+            embed = discord.Embed(
+                title="Checker Started",
+                description=f"Checker Started in {channel.mention}",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow(),
+            )
+            await channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Failed to send start message in {channel.name}: {e}")
+
+async def send_proxy_dashboard_status(online=True):
+    channel = bot.get_channel(PROXY_DASHBOARD_CHANNEL_ID)
+    if not channel:
+        logger.warning("Proxy Dashboard channel not found.")
+        return
+
+    status_text = "Proxy Dashboard is Online" if online else "Proxy Dashboard is Offline"
+    embed = discord.Embed(
+        title="Proxy Dashboard Status",
+        description=status_text,
+        color=discord.Color.blue() if online else discord.Color.red(),
+        timestamp=datetime.utcnow(),
+    )
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Failed to send proxy dashboard status: {e}")
+
+async def send_logs_status():
+    channel = bot.get_channel(KICK_LOGS_CHANNEL_ID)
+    if not channel:
+        logger.warning("Kick logs channel not found.")
+        return
+
+    embed = discord.Embed(
+        title="Logging Checker",
+        description="Checker is logging activity and errors.",
+        color=discord.Color.orange(),
+        timestamp=datetime.utcnow(),
+    )
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Failed to send logs status: {e}")
 
 @bot.event
 async def on_ready():
-    logging.info(f"Bot logged in as {bot.user} (ID: {bot.user.id})")
-    # Optional: Auto-start checker on bot start
-    # await kickstart(None)
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-if __name__ == "__main__":
-    bot.run(TOKEN)
+    # Send start messages to category channels
+    await send_category_start_messages()
 
+    # Send proxy dashboard online status
+    await send_proxy_dashboard_status(online=True)
+
+    # Send logs status
+    await send_logs_status()
+
+    # Refresh proxies at startup
+    await proxy_manager.refresh_proxies()
+
+    # Start the username checker
+    global checker, checker_task
+    checker = KickUsernameChecker(proxy_manager)
+    if checker_task is None or checker_task.done():
+        checker_task = asyncio.create_task(checker.start())
+
+bot.run(TOKEN)
