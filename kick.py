@@ -123,13 +123,6 @@ class ProxyFailureException(Exception):
 
 class KickUsernameChecker:
     def __init__(self, proxy_manager, usernames, batch_size=100):
-        # ... your existing __init__ ...
-        self.last_stats_sent = 0  # Timestamp of last sent stats message
-
-    # ... other methods unchanged ...
-
-   class KickUsernameChecker:
-    def __init__(self, proxy_manager, usernames, batch_size=100):
         self.proxy_manager = proxy_manager
         self.usernames = usernames
         self.batch_size = batch_size
@@ -142,32 +135,71 @@ class KickUsernameChecker:
         self.status_message = None
         self.checker_channel = None
         self.status_channel = None
+        self.progress_task = None  # will hold the asyncio task
+
+    async def update_status(self, message: str):
+        # Your existing update_status code here
+        pass
+
+    async def log_progress_eta(self, interval_seconds=300):
+        """Periodically log ETA and progress while checker is running."""
+        while self.is_running:
+            total_usernames = len(self.usernames)
+            if total_usernames == 0:
+                await asyncio.sleep(interval_seconds)
+                continue
+
+            avg_resp_time = 1.0  # fallback average response time in seconds
+            # Get some proxy stats if available to estimate latency:
+            proxy = self.proxy_manager.get_proxy()
+            stats = self.proxy_manager.proxy_stats.get(proxy) if proxy else None
+            if stats:
+                avg_resp_time = stats.avg_response_time()
+
+            remaining = total_usernames - self.checked_count
+            eta_seconds = int(remaining * (avg_resp_time + 0.4))
+            eta_msg = f"⏳ Progress: {self.checked_count}/{total_usernames} | ETA: {eta_seconds // 60}m {eta_seconds % 60}s"
+            
+            # Send to logs or status channel:
+            if self.checker_channel is not None:
+                try:
+                    await self.checker_channel.send(eta_msg)
+                except Exception:
+                    pass  # handle if channel not found or rate limited
+            
+            if self.status_channel is not None and self.status_message:
+                try:
+                    await self.status_message.edit(content=eta_msg)
+                except Exception:
+                    pass
+            
+            await asyncio.sleep(interval_seconds)
 
     async def run(self):
         self.is_running = True
+
+        # Start the background ETA logging task
+        self.progress_task = asyncio.create_task(self.log_progress_eta(interval_seconds=300))
+
+        await self.update_status("Waiting For Proxy From Dashboard...")
+
         total_usernames = len(self.usernames)
-        # Your run method code here
 
-    # Start progress ETA logger task
-    progress_task = asyncio.create_task(self.log_progress_eta(interval_seconds=300))
-
-    await self.update_status("Waiting For Proxy From Dashboard...")
-
-    # Your existing checking loop here...
-
-    # At the end of run:
-    self.is_running = False
-
-    # Cancel progress logger task if still running
-    if not progress_task.done():
-        progress_task.cancel()
-        try:
-            await progress_task
-        except asyncio.CancelledError:
+        while self.is_running and self.checked_count < total_usernames:
+            # Your existing main checking loop logic here...
             pass
 
-    await self.update_status("✅ Checker finished or stopped.")
+        self.is_running = False
 
+        # Cancel the ETA logging task gracefully
+        if self.progress_task and not self.progress_task.done():
+            self.progress_task.cancel()
+            try:
+                await self.progress_task
+            except asyncio.CancelledError:
+                pass
+
+        await self.update_status("✅ Checker finished or stopped.")
         while self.is_running and self.checked_count < total_usernames:
             proxy = self.proxy_manager.get_proxy()
             if proxy is None:
