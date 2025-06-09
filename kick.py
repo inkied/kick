@@ -6,25 +6,23 @@ import time
 import random
 from discord.ext import commands
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 
-# ========== ENV VARS ==========
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 WEBSHARE_KEY = os.getenv("WEBSHARE_API_KEY")
 PROXY_USER = os.getenv("PROXY_USER")
 PROXY_PASS = os.getenv("PROXY_PASS")
 
-# ========== CONFIG ==========
 COMMAND_PREFIX = '.'
 CHECK_LIMIT = 100
 PROXY_MIN = 10
 PROXY_MAX = 50
 GOOD_PROXIES_FILE = "proxies.txt"
-PROXY_HEALTH_THRESHOLD = 50
-PROXY_BACKOFF = 10
+PROXY_HEALTH_THRESHOLD = 50  # %
+PROXY_RESPONSE_THRESHOLD = 5  # seconds
+PROXY_BACKOFF = 10  # sec cooldown between proxy uses
 USERS_FILE = "users.txt"
 HITS_FILE = "hits.txt"
 
@@ -56,20 +54,30 @@ class Proxy:
             self.response_time += response_time
         if success:
             self.hits += 1
-
-        if self.total >= PROXY_MIN and self.health < PROXY_HEALTH_THRESHOLD:
-            self.is_good = False
-
-        print(f"[Proxy Health] {self.proxy_str.split('@')[-1]} | "
-              f"Health: {self.health:.1f}% | Hits: {self.hits} | Total: {self.total} | "
-              f"Avg RT: {self.avg_response:.2f}s | Good: {self.is_good}")
+        if self.total >= 10:
+            self.is_good = (self.health >= PROXY_HEALTH_THRESHOLD and self.avg_response <= PROXY_RESPONSE_THRESHOLD)
 
 class ProxyManager:
     def __init__(self):
         self.proxies = []
         self.lock = asyncio.Lock()
 
-    async def fetch(self):
+    def load_good_proxies(self):
+        if not os.path.exists(GOOD_PROXIES_FILE):
+            return
+        with open(GOOD_PROXIES_FILE, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        self.proxies = [Proxy(p) for p in lines]
+        print(f"[ProxyManager] Loaded {len(self.proxies)} proxies from {GOOD_PROXIES_FILE}")
+
+    def save_good_proxies(self):
+        good = [p.proxy_str for p in self.proxies if p.is_good]
+        with open(GOOD_PROXIES_FILE, "w") as f:
+            for proxy in good:
+                f.write(proxy + "\n")
+        print(f"[ProxyManager] Saved {len(good)} good proxies to {GOOD_PROXIES_FILE}")
+
+    async def fetch_new_proxies(self):
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
             async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
@@ -83,66 +91,57 @@ class ProxyManager:
                         proxies_list.append(proxy_url)
                 return proxies_list
 
-    async def load(self):
-        loaded = self.load_good_proxies()
+    async def refill_proxies(self):
         async with self.lock:
-            self.proxies = loaded
-            fresh = await self.fetch()
-            for p in fresh:
-                if p not in [x.proxy_str for x in self.proxies]:
-                    self.proxies.append(Proxy(p))
-            self.proxies = self.proxies[-PROXY_MAX:]
-        print(f"[ProxyManager] Loaded {len(self.proxies)} proxies total.")
+            before = len(self.proxies)
+            self.proxies = [p for p in self.proxies if p.is_good]
+            removed = before - len(self.proxies)
+            if removed:
+                print(f"[ProxyManager] Removed {removed} bad/slow proxies")
 
-    def save_good_proxies(self):
-        good = [p.proxy_str for p in self.proxies if p.is_good]
-        with open(GOOD_PROXIES_FILE, "w") as f:
-            for proxy in good:
-                f.write(proxy + "\n")
-        print(f"[ProxyManager] Saved {len(good)} good proxies to {GOOD_PROXIES_FILE}")
+            if len(self.proxies) < PROXY_MIN:
+                print("[ProxyManager] Proxy pool low, fetching new proxies...")
+                fresh = await self.fetch_new_proxies()
+                existing = {p.proxy_str for p in self.proxies}
+                added = 0
+                for p_str in fresh:
+                    if p_str not in existing and len(self.proxies) < PROXY_MAX:
+                        self.proxies.append(Proxy(p_str))
+                        added += 1
+                print(f"[ProxyManager] Added {added} new proxies")
 
-    def load_good_proxies(self):
-        if not os.path.exists(GOOD_PROXIES_FILE):
-            return []
-        with open(GOOD_PROXIES_FILE, "r") as f:
-            lines = [line.strip() for line in f if line.strip()]
-        print(f"[ProxyManager] Loaded {len(lines)} proxies from {GOOD_PROXIES_FILE}")
-        return [Proxy(p) for p in lines]
+            self.proxies.sort(key=lambda x: (-x.hits, x.avg_response))
+            self.proxies = self.proxies[:PROXY_MAX]
 
-    async def get(self):
+            self.save_good_proxies()
+
+    async def get_proxy(self):
         async with self.lock:
             now = time.time()
-            valid = [p for p in self.proxies if p.is_good and (now - p.last_used) > PROXY_BACKOFF]
-            valid = sorted(valid, key=lambda x: x.avg_response)
-            if not valid:
-                print("[ProxyManager] No healthy proxies available, restocking...")
-                await self.load()
-                valid = [p for p in self.proxies if p.is_good]
-            if not valid:
-                print("[ProxyManager] No proxies available at all!")
+            available = [p for p in self.proxies if p.is_good and (now - p.last_used) > PROXY_BACKOFF]
+            if not available:
+                await self.refill_proxies()
+                now = time.time()
+                available = [p for p in self.proxies if p.is_good and (now - p.last_used) > PROXY_BACKOFF]
+            if not available:
+                print("[ProxyManager] No good proxies available!")
                 return None
-            return random.choice(valid)
+            available.sort(key=lambda p: p.avg_response)
+            return random.choice(available)
 
 proxy_manager = ProxyManager()
-checked, available = 0, []
-checker_running = False
+proxy_manager.load_good_proxies()
 
-def generate_usernames(n):
-    base = ["live", "chat", "play", "stream", "kick", "zone", "cult", "digi"]
-    new_users = []
-    for _ in range(n):
-        name = random.choice(base) + str(random.randint(1, 9999))
-        new_users.append(name)
-    with open(USERS_FILE, "a") as f:
-        for user in new_users:
-            f.write(user + "\n")
-    print(f"[UsernameGen] Added {n} new usernames to {USERS_FILE}")
-    return new_users
+checked = 0
+available_users = []
+checker_running = False
+checker_task = None
 
 async def check_username(username):
-    proxy_obj = await proxy_manager.get()
+    proxy_obj = await proxy_manager.get_proxy()
     if not proxy_obj:
         return False
+
     start = time.time()
     success = False
     try:
@@ -150,81 +149,96 @@ async def check_username(username):
             async with session.get(f"https://kick.com/{username}", proxy=proxy_obj.proxy_str, timeout=10) as r:
                 if r.status == 404:
                     success = True
-    except Exception:
-        pass
-    elapsed = time.time() - start
-    proxy_obj.update(elapsed, success)
+    except:
+        success = False
+
+    response_time = time.time() - start
+    proxy_obj.update(response_time, success)
     return success
 
-async def run_checker(channel):
-    global checked, available, checker_running
-    checked, available = 0, []
-    checker_running = True
-    await proxy_manager.load()
-
+async def checker_loop():
+    global checked, available_users, checker_running
     while checker_running:
-        if not os.path.exists(USERS_FILE) or os.path.getsize(USERS_FILE) == 0:
-            generate_usernames(CHECK_LIMIT)
-
+        if not os.path.exists(USERS_FILE):
+            await asyncio.sleep(5)
+            continue
         with open(USERS_FILE, "r") as f:
-            usernames = [line.strip() for line in f if line.strip()]
-        print(f"[Checker] Loaded {len(usernames)} usernames")
+            users = [u.strip() for u in f if u.strip()]
+        if not users:
+            print("[Checker] No users to check, generating more...")
+            # Add your username generation logic here if needed
+            await asyncio.sleep(5)
+            continue
 
-        for username in usernames:
+        batch = users[:CHECK_LIMIT]
+        print(f"[Checker] Checking batch of {len(batch)} usernames...")
+        for username in batch:
             if not checker_running:
                 break
+            is_available = await check_username(username)
             checked += 1
-            success = await check_username(username)
-            if success:
-                available.append(username)
+            if is_available:
+                available_users.append(username)
                 with open(HITS_FILE, "a") as f:
                     f.write(username + "\n")
-                await channel.send(f"[HIT] https://kick.com/{username}")
-            await asyncio.sleep(random.uniform(0.4, 1.2))
+                print(f"[Hit] {username} is available!")
+            await asyncio.sleep(random.uniform(0.3, 1.2))
 
+        # Remove checked users from users.txt
         with open(USERS_FILE, "w") as f:
-            f.truncate()
-        generate_usernames(CHECK_LIMIT)
-        print("[Checker] Batch complete. Rotating usernames.")
+            f.writelines(u + "\n" for u in users[CHECK_LIMIT:])
 
-# === YOUR ORIGINAL DISCORD COMMANDS ===
+        # Refill proxies after batch
+        await proxy_manager.refill_proxies()
 
 @bot.command()
 async def kickstart(ctx):
-    global checker_running
+    global checker_running, checker_task
     if checker_running:
-        await ctx.send("⚠️ Checker already running.")
+        await ctx.send("Checker is already running.")
         return
-    await ctx.send("✅ Checker started and resuming from last stop...")
-    await run_checker(ctx.channel)
+    checker_running = True
+    checker_task = asyncio.create_task(checker_loop())
+    await ctx.send("Checker started.")
 
 @bot.command()
 async def kickstop(ctx):
-    global checker_running
+    global checker_running, checker_task
+    if not checker_running:
+        await ctx.send("Checker is not running.")
+        return
     checker_running = False
-    await ctx.send("🛑 Checker paused.")
+    if checker_task:
+        checker_task.cancel()
+        checker_task = None
+    await ctx.send("Checker stopped.")
 
 @bot.command()
 async def kickstatus(ctx):
-    if not checker_running:
-        await ctx.send("⚠️ Checker is not running.")
-        return
-    proxy_count = len(proxy_manager.proxies)
-    healthy = len([p for p in proxy_manager.proxies if p.is_good])
-    avg_speed = sum(p.avg_response for p in proxy_manager.proxies if p.total) / healthy if healthy else 0
-    hit_rate = round((len(available) / checked) * 100, 2) if checked else 0
-    eta = (len(available) / checked) * (CHECK_LIMIT - checked) if checked else 0
+    global checked, available_users
+    total_proxies = len(proxy_manager.proxies)
+    healthy_proxies = sum(1 for p in proxy_manager.proxies if p.is_good)
+    unhealthy_proxies = total_proxies - healthy_proxies
 
-    embed = discord.Embed(title="📊 Kick Checker Status", color=0x00ff00)
-    embed.add_field(name="🧠 Proxy Health", value=f"{(healthy / proxy_count) * 100:.2f}%", inline=True)
-    embed.add_field(name="⚡ Speed (avg)", value=f"{avg_speed:.2f}s", inline=True)
-    embed.add_field(name="🔥 Hit Success", value=f"{hit_rate}%", inline=True)
-    embed.add_field(name="🕒 Time", value=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'), inline=False)
-    embed.add_field(name="📌 Estimated Remaining", value=f"{int(eta)} usernames", inline=False)
-    await ctx.send(embed=embed)
+    top_proxies = sorted(proxy_manager.proxies, key=lambda p: (-p.hits, p.avg_response))[:10]
 
-@bot.event
-async def on_ready():
-    print(f"[Discord] Logged in as {bot.user.name}")
+    hits_count = len(available_users)
+
+    status_msg = (
+        f"**Checker Status:**\n"
+        f"Checked usernames: {checked}\n"
+        f"Available users found: {hits_count}\n"
+        f"Total proxies: {total_proxies}\n"
+        f"Healthy proxies: {healthy_proxies}\n"
+        f"Unhealthy proxies: {unhealthy_proxies}\n"
+        f"**Top 10 Proxies:**\n"
+    )
+    for i, proxy in enumerate(top_proxies, 1):
+        status_msg += (
+            f"{i}. {proxy.proxy_str} | Hits: {proxy.hits} | "
+            f"Health: {proxy.health}% | Avg Resp: {proxy.avg_response:.2f}s\n"
+        )
+
+    await ctx.send(status_msg)
 
 bot.run(DISCORD_TOKEN)
