@@ -138,6 +138,9 @@ class ProxyManager:
                     return proxy
             return None
 
+proxy_manager = ProxyManager()
+generator = UsernameGenerator()
+
 class UsernameGenerator:
     def __init__(self):
         self.static_users = []
@@ -273,18 +276,37 @@ class DiscordBot:
 
       @bot.command(name="start")
 async def start(ctx):
-    await ctx.send("Starting username checker...")
-    bot.loop.create_task(run_checker_loop(ctx))  # Starts the loop in background
+    await ctx.send("Started Kick Checker🚀")
+    bot.loop.create_task(run_checker_loop(ctx))
 
 async def run_checker_loop(ctx):
     while True:
-        # Example of where your main loop logic will go:
-        # 1. Get next username
-        # 2. Get proxy from manager
-        # 3. Send HTTP request to check username
-        # 4. Handle success/failure
-        # 5. Alert via Discord if needed
-        await asyncio.sleep(1)  # <- Replace with real logic and delay as needed
+        try:
+            username = generator.get_next_username()
+            proxy = await proxy_manager.get_proxy()
+            if not proxy:
+                await ctx.send("⚠️ No good proxies available. Waiting...")
+                await asyncio.sleep(10)
+                continue
+
+            start_time = time.time()
+            available = await check_username(username, proxy.proxy_str)
+            response_time = time.time() - start_time
+            proxy.update(response_time, available)
+
+            if available:
+                await ctx.send(f"✅ `{username}` is **available**!")
+                with open("available.txt", "a") as f:
+                    f.write(username + "\n")
+            else:
+                print(f"[✘] {username} is taken | {proxy.get_indicator()} | {proxy.proxy_str}")
+
+            await proxy_manager.refill_proxies()
+            await asyncio.sleep(random.uniform(0.5, 1.2))
+
+        except Exception as e:
+            print(f"[Loop Error] {e}")
+            await asyncio.sleep(1)
        
         @self.bot.command()
         async def pause(ctx):
