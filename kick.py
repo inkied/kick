@@ -273,9 +273,18 @@ class DiscordBot:
 
       @bot.command(name="start")
 async def start(ctx):
-    await ctx.send("Started username checking.")
-    # You can kick off your main async loop here
-    bot.loop.create_task(run_checker_loop(ctx))
+    await ctx.send("Starting username checker...")
+    bot.loop.create_task(run_checker_loop(ctx))  # Starts the loop in background
+
+async def run_checker_loop(ctx):
+    while True:
+        # Example of where your main loop logic will go:
+        # 1. Get next username
+        # 2. Get proxy from manager
+        # 3. Send HTTP request to check username
+        # 4. Handle success/failure
+        # 5. Alert via Discord if needed
+        await asyncio.sleep(1)  # <- Replace with real logic and delay as needed
        
         @self.bot.command()
         async def pause(ctx):
