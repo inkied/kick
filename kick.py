@@ -129,9 +129,24 @@ class KickUsernameChecker:
     # ... other methods unchanged ...
 
    class KickUsernameChecker:
+    def __init__(self, proxy_manager, usernames, batch_size=100):
+        self.proxy_manager = proxy_manager
+        self.usernames = usernames
+        self.batch_size = batch_size
+        self.checked_count = 0
+        self.available_count = 0
+        self.failed_proxy_count = 0
+        self.failed_other_count = 0
+        self.current_username = None
+        self.is_running = False
+        self.status_message = None
+        self.checker_channel = None
+        self.status_channel = None
+
     async def run(self):
         self.is_running = True
         total_usernames = len(self.usernames)
+        # Your run method code here
 
     # Start progress ETA logger task
     progress_task = asyncio.create_task(self.log_progress_eta(interval_seconds=300))
