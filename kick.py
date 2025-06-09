@@ -20,6 +20,30 @@ PROXY_FILE = os.getenv("PROXY_FILE", "proxies.txt")
 HITS_FILE = os.getenv("HITS_FILE", "hits.txt")
 DEBUG_LOG = os.getenv("DEBUG_LOG", "True").lower() == "true"
 
+async def fetch_and_save_proxies():
+    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&limit=100"
+    headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                print(f"Failed to fetch proxies, status: {resp.status}")
+                return
+            data = await resp.json()
+            proxies_list = []
+            for proxy_data in data.get("results", []):
+                ip = proxy_data.get("proxy_address")
+                port = proxy_data.get("port") or proxy_data.get("proxy_port")
+                if ip and port:
+                    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}"
+                    proxies_list.append(proxy_url)
+            with open(PROXY_FILE, "w") as f:
+                for proxy in proxies_list:
+                    f.write(proxy + "\n")
+            print(f"Saved {len(proxies_list)} proxies to {PROXY_FILE}")
+
+asyncio.run(fetch_and_save_proxies())
+
 # -------- SETUP LOGGING --------
 logging.basicConfig(level=logging.DEBUG if DEBUG_LOG else logging.INFO)
 logger = logging.getLogger("kick_checker")
