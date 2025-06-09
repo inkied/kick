@@ -271,9 +271,11 @@ class DiscordBot:
             self.channel = self.bot.get_channel(self.channel_id)
             print(f"[DiscordBot] Logged in as {self.bot.user}")
 
-        @bot.command()
+      @bot.command(name="start")
 async def start(ctx):
-    await ctx.send("Checking Started")
+    await ctx.send("Started username checking.")
+    # You can kick off your main async loop here
+    bot.loop.create_task(run_checker_loop(ctx))
        
         @self.bot.command()
         async def pause(ctx):
