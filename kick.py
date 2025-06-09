@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 from datetime import datetime
 from itertools import product
 
+intents = discord.Intents.default()
+intents.message_content = True  # Needed to read user messages like .pause, .status, etc.
+
 bot = commands.Bot(command_prefix='.', intents=intents)
 
 # Load environment variables
@@ -21,9 +24,6 @@ DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 WEBSHARE_KEY = os.getenv("WEBSHARE_API_KEY")
 PROXY_USER = os.getenv("PROXY_USER")
 PROXY_PASS = os.getenv("PROXY_PASS")
-
-intents = discord.Intents.default()
-intents.message_content = True  # Needed if you're reading message content
 
 GOOD_PROXIES_FILE = "proxies.txt"
 PROXY_MIN = 10
