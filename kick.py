@@ -101,18 +101,33 @@ class ProxyManager:
         print(f"[ProxyManager] Saved {len(good)} good proxies to {GOOD_PROXIES_FILE}")
 
     async def fetch_new_proxies(self):
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
-            async with session.get("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct", headers=headers) as r:
+    url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&limit=100"
+    headers = {"Authorization": f"Token {WEBSHARE_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as r:
+                if r.status != 200:
+                    print(f"[ERROR] Proxy fetch failed with status: {r.status}")
+                    return []
+
                 data = await r.json()
                 proxies_list = []
+
                 for proxy_data in data.get("results", []):
                     ip = proxy_data.get("proxy_address")
                     port = proxy_data.get("port") or proxy_data.get("proxy_port")
                     if ip and port:
                         proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{ip}:{port}"
                         proxies_list.append(proxy_url)
+
+                print(f"[DEBUG] Fetched {len(proxies_list)} proxies.")
                 return proxies_list
+
+    except Exception as e:
+        print(f"[ERROR] Exception while fetching proxies: {e}")
+        return []
 
     async def refill_proxies(self):
         async with self.lock:
