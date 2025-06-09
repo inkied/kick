@@ -28,6 +28,7 @@ PROXY_MAX = 50
 PROXY_HEALTH_THRESHOLD = 50
 PROXY_RESPONSE_THRESHOLD = 5
 PROXY_BACKOFF = 10
+PROXY_POOL_USE_FILE_THRESHOLD = 20  # Threshold to switch to proxies.txt pool
 
 class Proxy:
     def __init__(self, proxy_str):
@@ -77,6 +78,7 @@ class ProxyManager:
     def __init__(self):
         self.proxies = []
         self.lock = asyncio.Lock()
+        self.use_file_pool = False
 
     def load_good_proxies(self):
         if not os.path.exists(GOOD_PROXIES_FILE):
@@ -85,6 +87,8 @@ class ProxyManager:
             lines = [line.strip() for line in f if line.strip()]
         self.proxies = [Proxy(p) for p in lines]
         print(f"[ProxyManager] Loaded {len(self.proxies)} proxies from {GOOD_PROXIES_FILE}")
+        if len(self.proxies) >= PROXY_POOL_USE_FILE_THRESHOLD:
+            self.use_file_pool = True
 
     def save_good_proxies(self):
         good = [p.proxy_str for p in self.proxies if p.is_good]
@@ -117,6 +121,7 @@ class ProxyManager:
 
             if len(self.proxies) < PROXY_MIN:
                 print("[ProxyManager] Proxy pool low, fetching new proxies...")
+                await send_discord_message("Grabbing Best Proxies...")
                 fresh = await self.fetch_new_proxies()
                 existing = {p.proxy_str for p in self.proxies}
                 added = 0
@@ -125,9 +130,12 @@ class ProxyManager:
                         self.proxies.append(Proxy(p_str))
                         added += 1
                 print(f"[ProxyManager] Added {added} new proxies")
+                await send_discord_message("Grabbed Best Proxies!")
 
-            self.proxies.sort(key=lambda x: (x.avg_response, -x.hits))
+            # Sort proxies: best health first, then fastest response time
+            self.proxies.sort(key=lambda p: (-p.health, p.avg_response))
             self.proxies = self.proxies[:PROXY_MAX]
+
             self.save_good_proxies()
 
     async def get_proxy(self):
@@ -138,8 +146,13 @@ class ProxyManager:
                     return proxy
             return None
 
-proxy_manager = ProxyManager()
-generator = UsernameGenerator()
+# Discord messaging helper for announcements
+async def send_discord_message(content: str):
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel:
+        await channel.send(content)
+    else:
+        print(f"[Discord] Channel {DISCORD_CHANNEL_ID} not found. Message: {content}")
 
 class UsernameGenerator:
     def __init__(self):
@@ -179,221 +192,120 @@ class UsernameGenerator:
         consonants = ''.join(set(string.ascii_lowercase) - set(vowels))
         return random.choice(consonants) + random.choice(vowels) + random.choice(consonants) + random.choice(vowels)
 
-# Part 4: Main username checker loop, HTTP logic, Discord alert sending
+# Global control variables
+checker_running = False
+pause_event = asyncio.Event()
+pause_event.set()  # Start as not paused
+last_available_username = None
+last_checked_username = None
+last_proxy_used = None
+proxy_manager = ProxyManager()
+username_generator = UsernameGenerator()
 
-class UsernameChecker:
-    def __init__(self, proxy_manager, discord_bot, username_source):
-        self.proxy_manager = proxy_manager
-        self.discord_bot = discord_bot
-        self.username_source = username_source
-        self.running = True
-        self.paused = False
-        self.checked_count = 0
-        self.start_time = time.time()
-
-    async def check_username(self, username):
-        proxy_obj = await self.proxy_manager.get_best_proxy()
-        proxy = proxy_obj.proxy_str if proxy_obj else None
-
-        url = f"https://kick.com/api/v1/users/{username}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; UsernameChecker/1.0)",
-            "Accept": "application/json"
-        }
-
-        start = time.time()
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, proxy=proxy, timeout=10) as response:
-                    elapsed = time.time() - start
-                    proxy_obj.update(elapsed, True)  # success update proxy health
-
-                    if response.status == 404:
-                        # Username available
-                        timestamp = datetime.datetime.now().strftime("%m/%d/%Y")
-                        with open("hits.txt", "a") as f:
-                            f.write(f"{username} | Checked tries: {proxy_obj.total} | Time: {timestamp}\n")
-
-                        await self.discord_bot.send_alert(username)
-                        return True
-                    elif response.status == 200:
-                        # Username taken
-                        return False
-                    else:
-                        # Other status codes, treat as fail for proxy health
-                        proxy_obj.update(elapsed, False)
-                        return False
-        except Exception as e:
-            elapsed = time.time() - start
-            if proxy_obj:
-                proxy_obj.update(elapsed, False)
-            return False
-
-    async def main_loop(self):
-        while self.running:
-            if self.paused:
-                await asyncio.sleep(1)
-                continue
-
-            username = await self.username_source.get_next_username()
-            if not username:
-                # Refill list or wait
-                await self.username_source.refill()
-                await asyncio.sleep(1)
-                continue
-
-            self.checked_count += 1
-            available = await self.check_username(username)
-
-            # Adjust proxy priority here if needed based on health
-
-            # You can add heartbeat or UI update here as needed
-
-            await asyncio.sleep(0.1)  # adjust delay for rate-limiting or smoothing
-
-    def pause(self):
-        self.paused = True
-
-    def resume(self):
-        self.paused = False
-
-    def stop(self):
-        self.running = False
-
-
-class DiscordBot:
-    def __init__(self, token, channel_id):
-        intents = discord.Intents.default()
-        self.bot = commands.Bot(command_prefix=".", intents=intents)
-        self.token = token
-        self.channel_id = channel_id
-        self.channel = None
-
-        @self.bot.event
-        async def on_ready():
-            self.channel = self.bot.get_channel(self.channel_id)
-            print(f"[DiscordBot] Logged in as {self.bot.user}")
-
-      @bot.command(name="start")
+@bot.command()
 async def start(ctx):
-    await ctx.send("Started Kick Checker🚀")
-    bot.loop.create_task(run_checker_loop(ctx))
+    global checker_running
+    if checker_running:
+        await ctx.send("Checker is already running.")
+        return
+    checker_running = True
+    await ctx.send("Starting username checker...")
+    await proxy_manager.load_good_proxies()
+    await proxy_manager.refill_proxies()
+    await username_checker_loop(ctx)
 
-async def run_checker_loop(ctx):
-    while True:
-        try:
-            username = generator.get_next_username()
-            proxy = await proxy_manager.get_proxy()
-            if not proxy:
-                await ctx.send("⚠️ No good proxies available. Waiting...")
-                await asyncio.sleep(10)
-                continue
+@bot.command()
+async def stop(ctx):
+    global checker_running
+    if not checker_running:
+        await ctx.send("Checker is not running.")
+        return
+    checker_running = False
+    await ctx.send("Checker stopped.")
 
-            start_time = time.time()
-            available = await check_username(username, proxy.proxy_str)
-            response_time = time.time() - start_time
-            proxy.update(response_time, available)
+@bot.command()
+async def pause(ctx):
+    if not pause_event.is_set():
+        await ctx.send("Checker is already paused.")
+        return
+    pause_event.clear()
+    await ctx.send("Checker paused.")
 
-            if available:
-                await ctx.send(f"✅ `{username}` is **available**!")
-                with open("available.txt", "a") as f:
-                    f.write(username + "\n")
-            else:
-                print(f"[✘] {username} is taken | {proxy.get_indicator()} | {proxy.proxy_str}")
+@bot.command()
+async def resume(ctx):
+    if pause_event.is_set():
+        await ctx.send("Checker is not paused.")
+        return
+    pause_event.set()
+    await ctx.send("Checker resumed.")
 
+@bot.command()
+async def status(ctx):
+    total_proxies = len(proxy_manager.proxies)
+    good_proxies = sum(1 for p in proxy_manager.proxies if p.is_good)
+    avg_health = round(sum(p.health for p in proxy_manager.proxies) / total_proxies, 2) if total_proxies else 0
+    avg_response = round(sum(p.avg_response for p in proxy_manager.proxies) / total_proxies, 2) if total_proxies else 0
+    global last_available_username, last_checked_username, last_proxy_used
+    msg = (
+        f"**Checker Status:**\n"
+        f"Running: {checker_running}\n"
+        f"Paused: {not pause_event.is_set()}\n"
+        f"Last Available Username: {last_available_username}\n"
+        f"Last Checked Username: {last_checked_username}\n"
+        f"Last Proxy Used: {last_proxy_used.proxy_str if last_proxy_used else 'None'}\n"
+        f"Total Proxies: {total_proxies}\n"
+        f"Good Proxies: {good_proxies}\n"
+        f"Average Proxy Health: {avg_health}%\n"
+        f"Average Proxy Response: {avg_response:.2f}s\n"
+    )
+    await ctx.send(msg)
+
+async def username_checker_loop(ctx):
+    global last_available_username, last_checked_username, last_proxy_used, checker_running
+
+    while checker_running:
+        await pause_event.wait()
+        username = username_generator.get_next_username()
+        last_checked_username = username
+
+        proxy = await proxy_manager.get_proxy()
+        if proxy is None:
+            await ctx.send("No good proxies available, refilling...")
             await proxy_manager.refill_proxies()
-            await asyncio.sleep(random.uniform(0.5, 1.2))
+            await asyncio.sleep(5)
+            continue
+        last_proxy_used = proxy
 
-        except Exception as e:
-            print(f"[Loop Error] {e}")
-            await asyncio.sleep(1)
-       
-        @self.bot.command()
-        async def pause(ctx):
-            checker.pause()
-            await ctx.send("⏸️")
+        # Example check logic here (replace with actual API check)
+        start_time = time.time()
+        # Simulate request with proxy
+        success = random.choice([True, False])  # Fake availability result
+        response_time = time.time() - start_time
+        proxy.update(response_time, success)
 
-        @self.bot.command()
-        async def resume(ctx):
-            checker.resume()
-            await ctx.send("▶️")
+        if success:
+            last_available_username = username
+            await ctx.send(f"Available username found: {username}")
 
-        @self.bot.command()
-        async def stop(ctx):
-            checker.stop()
-            await ctx.send("🛑")
+        # Periodically save good proxies and refresh pool
+        if random.random() < 0.1:
+            proxy_manager.save_good_proxies()
+            await proxy_manager.refill_proxies()
 
-    async def send_alert(self, username):
-        if not self.channel:
-            print("[DiscordBot] Channel not ready.")
-            return
-        await self.channel.send(f"✅ Username available: {username}")
+        await asyncio.sleep(random.uniform(0.4, 1.2))
 
-    def run(self):
-        self.bot.run(self.token)
+    # After stopping, save proxies
+    proxy_manager.save_good_proxies()
 
-class UsernameSource:
-    def __init__(self, users_file="users.txt", themes_file="themes.txt"):
-        self.users_file = users_file
-        self.themes_file = themes_file
-        self.usernames = []
-        self.themes = []
-        self.lock = asyncio.Lock()
-        self.index = 0
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
 
-    async def load_users(self):
-        if not os.path.exists(self.users_file):
-            return
-        async with self.lock:
-            with open(self.users_file, "r") as f:
-                self.usernames = [line.strip() for line in f if line.strip()]
-            self.index = 0
-            print(f"[UsernameSource] Loaded {len(self.usernames)} usernames from {self.users_file}")
+def shutdown():
+    print("Shutting down...")
+    asyncio.create_task(bot.close())
 
-    async def load_themes(self):
-        if not os.path.exists(self.themes_file):
-            return
-        async with self.lock:
-            with open(self.themes_file, "r") as f:
-                self.themes = [line.strip() for line in f if line.strip()]
-            print(f"[UsernameSource] Loaded {len(self.themes)} themes from {self.themes_file}")
-
-    async def refill(self):
-        # Reload users and append themed usernames
-        await self.load_users()
-        await self.load_themes()
-
-        async with self.lock:
-            # Example: combine themes with random suffixes or just append themes
-            themed_usernames = []
-            for theme in self.themes:
-                # You can generate themed usernames here, for simplicity just use theme
-                themed_usernames.append(theme)
-            # Append themed usernames to usernames list avoiding duplicates
-            for tuser in themed_usernames:
-                if tuser not in self.usernames:
-                    self.usernames.append(tuser)
-
-            print(f"[UsernameSource] Refilled username list with themes. Total now: {len(self.usernames)}")
-
-    async def get_next_username(self):
-        async with self.lock:
-            if self.index >= len(self.usernames):
-                return None
-            username = self.usernames[self.index]
-            self.index += 1
-            return username
-
-# Graceful shutdown helper
-def setup_graceful_shutdown(loop, checker, proxy_manager):
-
-    def shutdown():
-        print("[Shutdown] Stopping checker and saving proxies...")
-        checker.stop()
-        proxy_manager.save_good_proxies()
-        loop.stop()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown)
+signal.signal(signal.SIGINT, lambda s, f: shutdown())
+signal.signal(signal.SIGTERM, lambda s, f: shutdown())
 
 bot.run(DISCORD_TOKEN)
