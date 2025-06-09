@@ -10,7 +10,7 @@ import signal
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from datetime import datetime
-from intertools import product
+from itertools import product
 
 # Load environment variables
 load_dotenv()
